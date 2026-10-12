@@ -74,16 +74,18 @@ Docker → **Add Container** → paste the template URL:
 https://raw.githubusercontent.com/btoth525/Owlet-To-Rtsp/main/unraid/owlet-bridge-native.xml
 ```
 
-It comes pre‑configured: **Bridge** networking, ports that **coexist with Frigate's go2rtc** (which owns `1984/8554/8555`):
+It is **secure by default**: only the control panel is published.
 
-| Service | Host port | Container port |
-|---|---|---|
-| Control panel | `8088` | `8088` |
-| go2rtc video UI | `1985` | `1984` |
-| **RTSP** | **`18554`** | `8554` |
-| WebRTC | `18555` | `8555` |
+| Service | Host port | Container port | Notes |
+|---|---|---|---|
+| Control panel | `8088` | `8088` | HTTP Basic auth |
+| go2rtc API / video UI | *not published* | `1984` | bound to container loopback: the API can rewrite go2rtc's config and run commands |
+| **RTSP** | *not published* | `8554` | Frigate pulls it over a **shared Docker network**, with go2rtc credentials |
+| WebRTC | *not published* | `8555` | |
 
-and two volumes: **`/config`** (settings) and **`/app/libs`** (the TUTK libraries).
+Create a user‑defined network once (`docker network create owlet-net`) and set **Network Type = `owlet-net`** on both this container and Frigate. Set **`GO2RTC_PASS`** in the template (or leave it blank and read the generated one from `/config/secrets/go2rtc.json`, mode 0600).
+
+Two volumes: **`/config`** (settings) and **`/app/libs`** (the TUTK libraries).
 
 ### 2 · Make `/config` writable
 
@@ -109,9 +111,9 @@ In the control panel:
 
 ### 5 · Use it
 
-- Control panel: `http://<unraid-ip>:8088`
-- Video UI / preview: `http://<unraid-ip>:1985`
-- **RTSP: `rtsp://<unraid-ip>:18554/<camera-name>`** ← point Frigate here.
+- Control panel: `https://<unraid-ip>:8088`
+- **RTSP (from Frigate on `owlet-net`): `rtsp://<GO2RTC_USER>:<GO2RTC_PASS>@owlet-bridge-native:8554/<camera-name>`** ← point Frigate here.
+- The go2rtc video UI is not reachable from the LAN any more. If you really want it, set `GO2RTC_API_LISTEN=:1984` and publish the port yourself; go2rtc then requires `GO2RTC_USER`/`GO2RTC_PASS` for every non‑loopback client.
 
 > **Two‑way talk requires HTTPS.** The browser's microphone API only works on a secure origin. Open the panel on `https://` (self‑signed cert — accept the warning once) and the 🎤 hold‑to‑talk button becomes active.
 
@@ -125,7 +127,8 @@ Add the bridge as a go2rtc stream, then a record‑only camera. **Disable birdse
 go2rtc:
   streams:
     Owlet_Cam:
-      - rtsp://<unraid-ip>:18554/nursery      # the bridge (use your camera name)
+      # the bridge over the shared Docker network (use your camera name and GO2RTC_PASS)
+      - rtsp://owlet:<GO2RTC_PASS>@owlet-bridge-native:8554/nursery
 
 cameras:
   Owlet_Cam:
@@ -151,9 +154,10 @@ cameras:
 
 **docker run:**
 ```bash
-docker run -d --name owlet-bridge --restart unless-stopped \
-  -p 8088:8088 -p 1985:1984 -p 18554:8554 -p 18555:8555/tcp -p 18555:8555/udp \
-  -e PUBLIC_HTTP_PORT=1985 -e PUBLIC_RTSP_PORT=18554 -e PUBLIC_WEBRTC_PORT=18555 \
+docker network create owlet-net        # once; attach Frigate to it as well
+docker run -d --name owlet-bridge --restart unless-stopped --network owlet-net \
+  -p 8088:8088 \
+  -e GO2RTC_USER=owlet -e GO2RTC_PASS='<long random password>' \
   -v /path/to/owlet/config:/config \
   -v /path/to/owlet/libs:/app/libs \
   ghcr.io/btoth525/owlet-bridge-native:latest
@@ -285,7 +289,10 @@ Everything's set in the web UI; these env vars override or tune it:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `PUBLIC_HTTP_PORT` / `PUBLIC_RTSP_PORT` / `PUBLIC_WEBRTC_PORT` | `1984` / `8554` / `8555` | the **host** ports you mapped, so the UI shows reachable URLs |
+| `GO2RTC_USER` / `GO2RTC_PASS` | `owlet` / *(generated)* | credentials go2rtc requires on RTSP and its API for every non‑loopback client (`api.username`/`api.password`, `rtsp.username`/`rtsp.password`). Unset password = random one kept in `/config/secrets/go2rtc.json` (0600) |
+| `GO2RTC_API_LISTEN` | `127.0.0.1:1984` | go2rtc API bind address. Keep it on loopback; `:1984` only if you publish it deliberately |
+| `GO2RTC_RTSP_LISTEN` | `:8554` | RTSP bind address inside the container (reached by Frigate over the shared Docker network) |
+| `PUBLIC_RTSP_PORT` | `8554` | the port shown in the UI's copy URL |
 | `OWLET_KEEPALIVE` | `1` | keep one camera session warm 24/7 (auto‑reconnect). **Leave on.** |
 | `OWLET_SESSION_CHECK` | `0` | experimental: log the TUTK session mode (P2P/relay) after each connect — crashed the stream process on the reference camera's lib build, keep off unless debugging |
 | `OWLET_STALL_TIMEOUT` | `30` | seconds without a video frame before the stream process unblocks/relaunches itself (see [Self‑healing](native-bridge/docs/self-heal.md)) |
@@ -306,8 +313,8 @@ Everything's set in the web UI; these env vars override or tune it:
 |---|---|
 | **KMS `403 Forbidden`** on diagnose | DSN is wrong — it starts with the **letter `O`** (`OCD…`), not a zero. |
 | **`PermissionError` / settings won't save** | `chmod -R 777 /mnt/user/appdata/owlet/config`, restart. |
-| **Frigate can't reach the bridge** (`connection refused` / `no route`) | The bridge is on `br0`/macvlan — the host can't reach it. Switch to **Bridge** networking with the offset ports. |
-| **Port conflict with Frigate** | Frigate owns `1984/8554/8555`; the template already offsets the bridge to `1985/18554/18555`. |
+| **Frigate can't reach the bridge** (`connection refused` / `no route` / `401`) | Both containers must be on the same user‑defined Docker network (`owlet-net`), and the URL must carry `GO2RTC_USER:GO2RTC_PASS@`. |
+| **Port conflict with Frigate** | None by default: the bridge publishes only `8088`. |
 | **"Open video UI" / copy buttons don't work** | Set the `PUBLIC_*` env vars and pull `:latest` (clipboard is blocked on plain http — the new UI falls back). |
 | **Stream pops in and out** | Close the **Owlet app on all phones** — the cam allows one session and they fight. Keep `OWLET_KEEPALIVE` on. Check `docker exec owlet-bridge-native tail -50 /config/tutk.log`. |
 | **Video freezes a minute or two after (re)connecting, audio keeps going** | A wedged TUTK session with the stream's main thread blocked. The bridge now fixes this itself in ~30–90 s (`[stall]` lines in `/config/tutk-<camera>.log` show what was blocked); the container watchdog backs that up. See [Self‑healing](native-bridge/docs/self-heal.md) — and open `/api/status` → `watchdog` for live counters. |

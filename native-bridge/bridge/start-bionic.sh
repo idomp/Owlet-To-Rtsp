@@ -15,8 +15,8 @@ if [ ! -f /config/owlet.env ]; then
 fi
 
 echo "[owlet-bridge/bionic] control panel : http://<host>:8088"
-echo "[owlet-bridge/bionic] video UI       : http://<host>:1984"
-echo "[owlet-bridge/bionic] RTSP           : rtsp://<host>:8554/<camera>"
+echo "[owlet-bridge/bionic] go2rtc API     : container loopback only (GO2RTC_API_LISTEN to change)"
+echo "[owlet-bridge/bionic] RTSP           : rtsp://<GO2RTC_USER>:<GO2RTC_PASS>@<container>:8554/<camera> (shared Docker network)"
 
 # Cap the per-camera TUTK logs so they can't slowly fill appdata. tutk_client
 # appends to them via go2rtc's exec; keep the tail of any that grew past ~20 MB.

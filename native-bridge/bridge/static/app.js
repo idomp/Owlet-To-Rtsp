@@ -81,7 +81,8 @@ async function testLogin(btn) {
 function camUrls(name, s){
   const host = location.hostname, rp = s.rtsp_port || "8554", hp = s.http_port || "1984";
   return {
-    rtsp: `rtsp://${host}:${rp}/${name}`,
+    rtsp: s.rtsp_user ? `rtsp://${s.rtsp_user}:<GO2RTC_PASS>@${host}:${rp}/${name}`
+                      : `rtsp://${host}:${rp}/${name}`,
     web:  `http://${host}:${hp}/stream.html?src=${name}`,
     hls:  `http://${host}:${hp}/api/stream.m3u8?src=${name}`,
   };

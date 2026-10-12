@@ -288,6 +288,10 @@ def list_cameras():
         "cameras": cams,
         "rtsp_port": PUBLIC_RTSP_PORT, "http_port": PUBLIC_HTTP_PORT,
         "webrtc_port": PUBLIC_WEBRTC_PORT,
+        # go2rtc requires these on RTSP for non-loopback clients (Frigate). The
+        # password itself is never returned; it lives in GO2RTC_PASS or
+        # /config/secrets/go2rtc.json.
+        "rtsp_user": cs.go2rtc_credentials()[0],
     })
 
 

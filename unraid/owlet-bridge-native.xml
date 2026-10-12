@@ -9,13 +9,13 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/btoth525/Owlet-To-Rtsp</Support>
   <Project>https://github.com/btoth525/Owlet-To-Rtsp/tree/main/native-bridge/bridge</Project>
-  <Overview>Native Owlet Cam -&gt; RTSP bridge, the docker-wyze-bridge way. NO emulator. Enter your Owlet account in the web control panel (http://[IP]:8088), it logs into the Owlet cloud, connects to the camera over ThroughTek/Kalay (TUTK), and serves the video as RTSP/WebRTC/HLS with a go2rtc UI (http://[IP]:1985). Point Frigate at rtsp://[IP]:18554/owlet.
+  <Overview>Native Owlet Cam -&gt; RTSP bridge. Enter your Owlet account in the web control panel (https://[IP]:8088); it fetches the camera key, connects to the camera over ThroughTek/Kalay (TUTK) and serves the video as RTSP via go2rtc.
 
-EVERYTHING is configured in the UI: account credentials, region, camera DSN/UID/AuthKey, AV settings. "Connect &amp; Diagnose" runs the real login and auto-fetches your camera key; a live log + status dashboard show exactly what's happening.
+SECURE BY DEFAULT: only the control panel (8088) is published. go2rtc's HTTP API stays on container loopback (it can rewrite its config and run commands, so it is never published) and RTSP/WebRTC are NOT published.
 
-LIBRARIES: the proprietary TUTK .so libs are not shipped. Easiest path — in the web UI's "TUTK libraries" card, click "Upload &amp; extract" and pick your Owlet .apkm/.apk; the bridge pulls the x86_64 libraries out itself (it also auto-extracts any APK left in the config folder).
+FRIGATE: put this container and Frigate on the same user-defined Docker network (once: docker network create owlet-net; then set Network Type to owlet-net on both containers). Frigate then pulls rtsp://GO2RTC_USER:GO2RTC_PASS@owlet-bridge-native:8554/owlet over that network. If Frigate uses host networking instead, add a port mapping for container port 8554 yourself and firewall it to the Frigate host only.
 
-NOTE on networking: this uses standard Bridge networking. Host ports are offset (1985/18554/18555) so they don't collide with Frigate's built-in go2rtc (1984/8554/8555). Keep it on Bridge (not a br0/macvlan custom network) so other containers like Frigate can reach it.</Overview>
+LIBRARIES: the proprietary TUTK .so libs are not shipped. In the web UI's "TUTK libraries" card, click "Upload &amp; extract" and pick your Owlet .apkm/.apk.</Overview>
   <Category>Tools: MediaApp:Video HomeAutomation:</Category>
   <WebUI>https://[IP]:[PORT:8088]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/btoth525/Owlet-To-Rtsp/main/unraid/owlet-bridge-native.xml</TemplateURL>
@@ -25,14 +25,9 @@ NOTE on networking: this uses standard Bridge networking. Host ports are offset 
   <DonateText/>
   <DonateLink/>
   <Config Name="Control panel" Target="8088" Default="8088" Mode="tcp" Description="Web UI — enter Owlet login, upload libs, see status + logs." Type="Port" Display="always" Required="true" Mask="false">8088</Config>
-  <Config Name="Video UI (go2rtc)" Target="1984" Default="1985" Mode="tcp" Description="go2rtc UI — RTSP/WebRTC/HLS links + preview. Host 1985 to avoid Frigate's 1984." Type="Port" Display="always" Required="true" Mask="false">1985</Config>
-  <Config Name="RTSP" Target="8554" Default="18554" Mode="tcp" Description="rtsp://[IP]:18554/owlet — point Frigate here. Host 18554 to avoid Frigate's 8554." Type="Port" Display="always" Required="true" Mask="false">18554</Config>
-  <Config Name="WebRTC tcp" Target="8555" Default="18555" Mode="tcp" Description="WebRTC (host 18555 to avoid Frigate's 8555)." Type="Port" Display="advanced" Required="false" Mask="false">18555</Config>
-  <Config Name="WebRTC udp" Target="8555" Default="18555" Mode="udp" Description="WebRTC (host 18555 to avoid Frigate's 8555)." Type="Port" Display="advanced" Required="false" Mask="false">18555</Config>
-  <Config Name="PUBLIC_RTSP_PORT" Target="PUBLIC_RTSP_PORT" Default="18554" Mode="" Description="The HOST port you mapped RTSP (8554) to — so the UI shows reachable copy URLs. Match your RTSP port mapping above." Type="Variable" Display="advanced" Required="false" Mask="false">18554</Config>
-  <Config Name="PUBLIC_HTTP_PORT" Target="PUBLIC_HTTP_PORT" Default="1985" Mode="" Description="The HOST port you mapped the go2rtc UI (1984) to." Type="Variable" Display="advanced" Required="false" Mask="false">1985</Config>
-  <Config Name="PUBLIC_WEBRTC_PORT" Target="PUBLIC_WEBRTC_PORT" Default="18555" Mode="" Description="The HOST port you mapped WebRTC (8555) to." Type="Variable" Display="advanced" Required="false" Mask="false">18555</Config>
-  <Config Name="WebRTC candidate (app)" Target="OWLET_WEBRTC_CANDIDATE" Default="" Mode="" Description="For sub-second WebRTC to a phone/app, set this to &lt;Unraid-LAN-IP&gt;:&lt;WebRTC host port&gt;, e.g. 192.168.1.204:18555. This is the address go2rtc advertises to clients for the media connection — without it the app gets an SDP answer but no video. Leave blank if you only watch via Frigate or the LAN go2rtc UI." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="go2rtc user (RTSP)" Target="GO2RTC_USER" Default="owlet" Mode="" Description="Username go2rtc requires for RTSP (and its API, if you ever widen GO2RTC_API_LISTEN). Loopback clients inside the container are exempt." Type="Variable" Display="always" Required="true" Mask="false">owlet</Config>
+  <Config Name="go2rtc password (RTSP)" Target="GO2RTC_PASS" Default="" Mode="" Description="Password for the RTSP URL Frigate uses: rtsp://owlet:PASSWORD@owlet-bridge-native:8554/owlet. Leave blank to have one generated into /config/secrets/go2rtc.json (mode 0600)." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="WebRTC candidate (app)" Target="OWLET_WEBRTC_CANDIDATE" Default="" Mode="" Description="Only relevant if you deliberately publish WebRTC (8555) and the go2rtc API, which this template no longer does. For sub-second WebRTC to a phone/app, set this to &lt;Unraid-LAN-IP&gt;:&lt;WebRTC host port&gt;, e.g. 192.168.1.204:18555. This is the address go2rtc advertises to clients for the media connection — without it the app gets an SDP answer but no video. Leave blank if you only watch via Frigate or the LAN go2rtc UI." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="Config (settings)" Target="/config" Default="/mnt/user/appdata/owlet/config" Mode="rw" Description="Persists your UI settings + camera key. Drop your Owlet .apkm here too (or upload it in the UI)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/owlet/config</Config>
   <Config Name="TUTK libs (/app/libs)" Target="/app/libs" Default="/mnt/user/appdata/owlet/libs" Mode="rw" Description="Folder the extracted x86_64 TUTK .so libraries live in (under x86_64/). The UI's Upload &amp; extract writes them here." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/owlet/libs</Config>
 </Container>

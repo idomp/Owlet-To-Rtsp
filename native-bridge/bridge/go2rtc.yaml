@@ -4,14 +4,16 @@
 log:
   level: info
 
+# Baked-in fallback only (used when /config is not writable, so no RTSP/API
+# credentials can be generated): everything stays on container loopback.
 api:
-  listen: ":1984"
+  listen: "127.0.0.1:1984"
 
 rtsp:
-  listen: ":8554"
+  listen: "127.0.0.1:8554"
 
 webrtc:
-  listen: ":8555"
+  listen: "127.0.0.1:8555"
 
 streams:
   owlet:

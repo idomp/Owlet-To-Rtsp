@@ -1,9 +1,21 @@
 # owlet-bridge — native Owlet/Kalay -> RTSP, configured entirely from the web UI.
 #
+#   docker network create owlet-net          # once; attach Frigate to it too
 #   docker compose up -d --build
-#   open  http://<host>:8088   -> enter your Owlet login, Connect & Diagnose
+#   open  https://<host>:8088
 #
-# No emulator. Just credentials in, RTSP out — the wyze-bridge model.
+# Exposure model (secure by default):
+#   * Only the control panel (8088) is published.
+#   * go2rtc's HTTP API (1984) listens on container loopback only. It can rewrite
+#     its own config and run commands, so it is never published.
+#   * RTSP (8554) is NOT published. Frigate pulls it over the shared Docker
+#     network `owlet-net`, with go2rtc credentials:
+#         rtsp://<GO2RTC_USER>:<GO2RTC_PASS>@owlet-bridge:8554/<camera>
+#     (if GO2RTC_PASS is unset a random one is generated into
+#      /config/secrets/go2rtc.json, mode 0600).
+#   * WebRTC (8555) is not published.
+# If Frigate runs with host networking instead, publish RTSP to one host IP
+# (e.g. "192.168.1.10:18554:8554") and firewall it to the Frigate host only.
 
 name: owlet-bridge
 
@@ -15,12 +27,19 @@ services:
     image: ghcr.io/btoth525/owlet-bridge-native:latest
     container_name: owlet-bridge
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      GO2RTC_USER: "${GO2RTC_USER:-owlet}"
+      GO2RTC_PASS: "${GO2RTC_PASS:?set GO2RTC_PASS (RTSP password Frigate uses)}"
     volumes:
       - ${APPDATA:-/mnt/user/appdata/owlet}/config:/config   # settings persist here
       - ./libs:/app/libs:ro                                   # TUTK .so libs (from the APK)
     ports:
-      - "8088:8088"   # control panel
-      - "1984:1984"   # go2rtc video UI
-      - "8554:8554"   # RTSP -> Frigate
-      - "8555:8555/tcp"
-      - "8555:8555/udp"
+      - "8088:8088"   # control panel. Prefer "127.0.0.1:8088:8088" + SSH tunnel / auth proxy.
+    networks:
+      - owlet-net
+
+networks:
+  owlet-net:
+    external: true

@@ -1,0 +1,135 @@
+"""go2rtc exposure hardening: the generated config must require auth and keep
+the API on container loopback. Stdlib-only (PyYAML used when available).
+
+Run:  python3 -m unittest discover -s native-bridge/bridge/tests -v
+"""
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import config_store as cs  # noqa: E402
+
+try:
+    import yaml  # noqa: F401
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _section(text, name):
+    """Lines of one top-level YAML section of the rendered config."""
+    out, cur = [], None
+    for ln in text.splitlines():
+        if ln and not ln.startswith(" "):
+            cur = ln.rstrip(":")
+            continue
+        if cur == name and ln.strip():
+            out.append(ln.strip())
+    return out
+
+
+class Go2rtcAuthTests(unittest.TestCase):
+    def render(self, **kw):
+        return cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=("u1", "p-1_x"), **kw)
+
+    def test_api_binds_loopback_and_requires_auth(self):
+        api = _section(self.render(), "api")
+        self.assertIn('listen: "127.0.0.1:1984"', api)
+        self.assertIn('username: "u1"', api)
+        self.assertIn('password: "p-1_x"', api)
+
+    def test_rtsp_requires_auth(self):
+        rtsp = _section(self.render(), "rtsp")
+        self.assertIn('listen: ":8554"', rtsp)
+        self.assertIn('username: "u1"', rtsp)
+        self.assertIn('password: "p-1_x"', rtsp)
+
+    def test_no_api_listener_on_all_interfaces_by_default(self):
+        self.assertNotIn('listen: ":1984"', self.render())
+
+    @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+    def test_parses_as_go2rtc_keys(self):
+        d = yaml.safe_load(self.render())
+        self.assertEqual(d["api"], {"listen": "127.0.0.1:1984", "username": "u1",
+                                    "password": "p-1_x"})
+        self.assertEqual(d["rtsp"]["username"], "u1")
+        self.assertEqual(d["rtsp"]["password"], "p-1_x")
+        self.assertIn("owlet", d["streams"])
+
+    def test_creds_with_quotes_stay_one_yaml_scalar(self):
+        text = cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=('a"b', "c: d"))
+        self.assertIn('username: "a\\"b"', text)
+        self.assertIn('password: "c: d"', text)
+
+    def test_exec_sources_contain_no_hash(self):
+        """go2rtc cuts an exec source at the first '#' to parse its options
+        (internal/exec/exec.go); a stray '#' would truncate the command."""
+        for build in (cs._audio_source, cs._overlay_source):
+            self.assertNotIn("#", build("owlet"))
+
+
+class Go2rtcCredentialSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.p = mock.patch.multiple(
+            cs, SECRETS_DIR=os.path.join(self.tmp.name, "secrets"),
+            G2_SECRET_PATH=os.path.join(self.tmp.name, "secrets", "go2rtc.json"))
+        self.p.start()
+        self.addCleanup(self.p.stop)
+
+    def test_env_wins(self):
+        with mock.patch.dict(os.environ, {"GO2RTC_USER": "frigate", "GO2RTC_PASS": "s3cret"}):
+            self.assertEqual(cs.go2rtc_credentials(), ("frigate", "s3cret"))
+        self.assertFalse(os.path.exists(cs.G2_SECRET_PATH))
+
+    def test_generated_once_persisted_private_and_reused(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("GO2RTC_USER", "GO2RTC_PASS")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            u1, p1 = cs.go2rtc_credentials()
+            u2, p2 = cs.go2rtc_credentials()
+        self.assertEqual((u1, p1), (u2, p2))
+        self.assertEqual(u1, "owlet")
+        self.assertGreaterEqual(len(p1), 20)
+        with open(cs.G2_SECRET_PATH) as fh:
+            self.assertEqual(json.load(fh)["password"], p1)
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(os.stat(cs.G2_SECRET_PATH).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(cs.SECRETS_DIR).st_mode), 0o700)
+
+
+class FallbackConfigTests(unittest.TestCase):
+    def test_baked_in_fallback_is_loopback_only(self):
+        with open(os.path.join(HERE, "..", "go2rtc.yaml")) as fh:
+            text = fh.read()
+        self.assertIn('listen: "127.0.0.1:1984"', text)
+        self.assertIn('listen: "127.0.0.1:8554"', text)
+        self.assertNotIn('listen: ":', text)
+
+
+class DeploymentFilesTests(unittest.TestCase):
+    def test_compose_publishes_no_go2rtc_ports(self):
+        with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
+            live = [ln.split("#", 1)[0] for ln in fh if not ln.lstrip().startswith("#")]
+        text = "".join(live)
+        for port in ("1984", "1985", "8554", "8555"):
+            self.assertNotIn(port, text)
+        self.assertIn('"8088:8088"', text)
+
+    def test_unraid_template_publishes_no_go2rtc_ports(self):
+        with open(os.path.join(HERE, "..", "..", "..", "unraid",
+                               "owlet-bridge-native.xml"), encoding="utf-8") as fh:
+            text = fh.read()
+        for target in ('Target="1984"', 'Target="8554"', 'Target="8555"'):
+            self.assertNotIn(target, text)
+
+
+if __name__ == "__main__":
+    unittest.main()
