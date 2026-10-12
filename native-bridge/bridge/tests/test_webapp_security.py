@@ -60,6 +60,8 @@ class WebappTestBase(unittest.TestCase):
             mock.patch.object(cs, "G2_SECRET_PATH", os.path.join(d, "secrets", "go2rtc.json")),
             mock.patch.object(webapp, "restart_go2rtc", lambda *a, **k: None),
             mock.patch.object(webapp, "_go2rtc_streams", lambda: {}),
+            mock.patch.object(webapp, "UI_SECRET_PATH", os.path.join(d, "secrets", "ui.json")),
+            mock.patch.object(webapp, "_AUTH", {"t": 0.0, "user": "", "pass": ""}),
         ]
         for p in patches:
             p.start()
@@ -125,6 +127,135 @@ class UploadApkTests(WebappTestBase):
         files = os.listdir(os.path.join(self.dir, "uploads"))
         self.assertEqual(len(files), 1)
         self.assertTrue(files[0].endswith(".xapk"))
+
+
+class AuthDefaultTests(WebappTestBase):
+    def test_no_credentials_means_401(self):
+        r = self.c.get("/api/config")
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(self.c.get("/api/config", headers=_auth()).status_code, 200)
+
+    def test_without_env_creds_a_password_is_generated_not_open(self):
+        with mock.patch.object(webapp, "UI_USER", ""), mock.patch.object(webapp, "UI_PASS", ""):
+            self.assertEqual(self.c.get("/api/config").status_code, 401)
+            path = webapp.UI_SECRET_PATH
+            self.assertTrue(os.path.exists(path))
+            if os.name == "posix":
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            import json
+            d = json.load(open(path))
+            tok = base64.b64encode(f"{d['username']}:{d['password']}".encode()).decode()
+            r = self.c.get("/api/config", headers={"Authorization": f"Basic {tok}"})
+            self.assertEqual(r.status_code, 200)
+            # the password itself never reaches the in-app log
+            self.assertFalse(any(d["password"] in ln for ln in webapp.LOG))
+
+    def test_clearing_saved_ui_creds_does_not_disable_auth(self):
+        with mock.patch.object(webapp, "UI_USER", ""), mock.patch.object(webapp, "UI_PASS", ""):
+            cs.save_config(dict(cs.load_config(), ui_user="", ui_pass=""), regenerate=False)
+            self.assertEqual(self.c.get("/api/cameras").status_code, 401)
+
+    def test_unwritable_secret_fails_closed(self):
+        with mock.patch.object(webapp, "UI_USER", ""), mock.patch.object(webapp, "UI_PASS", ""),                 mock.patch.object(webapp, "_generated_ui_creds", lambda create=True: ("", "")):
+            self.assertEqual(self.c.get("/api/config").status_code, 503)
+
+
+class CameraMaskTests(WebappTestBase):
+    def setUp(self):
+        super().setUp()
+        cfg = cs.load_config()
+        cfg["cameras"] = [dict(cs.CAMERA_DEFAULTS, name="nursery", uid="UID123",
+                               authkey="AbCd1234", av_password="pw")]
+        cs.save_config(cfg)
+
+    def test_authkey_is_masked(self):
+        r = self.c.get("/api/cameras", headers=_auth())
+        cam = r.get_json()["cameras"][0]
+        self.assertEqual(cam["authkey"], "********")
+        self.assertNotIn("AbCd1234", r.get_data(as_text=True))
+
+    def test_masked_authkey_round_trip_keeps_real_key(self):
+        r = self.c.post("/api/cameras/nursery", headers=_auth(),
+                        json={"authkey": "********", "uid": "UID123"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(cs.find_camera(cs.load_config(), "nursery")["authkey"], "AbCd1234")
+
+
+class _FakeClient:
+    instances = []
+
+    def __init__(self, *a, **k):
+        self.connected_to = None
+        self.on_connect = None
+        _FakeClient.instances.append(self)
+
+    def username_pw_set(self, u, p):
+        self.creds = (u, p)
+
+    def connect(self, host, port, keepalive):
+        self.connected_to = (host, port)
+
+    def loop(self, timeout=0.1):
+        if self.on_connect:
+            self.on_connect(self, None, {}, 0)
+
+    def disconnect(self):
+        pass
+
+
+class MqttTestEndpointTests(WebappTestBase):
+    def setUp(self):
+        super().setUp()
+        cfg = cs.load_config()
+        cfg["mqtt"] = dict(cs.MQTT_DEFAULTS, enabled="1", host="10.0.0.5", port="1883",
+                           user="ha", password="brokerpw")
+        cs.save_config(cfg, regenerate=False)
+        _FakeClient.instances = []
+        fake = mock.MagicMock()
+        fake.Client = _FakeClient
+        del fake.CallbackAPIVersion
+        paho = mock.MagicMock()
+        paho.mqtt.client = fake
+        self.mods = mock.patch.dict(sys.modules, {"paho": paho, "paho.mqtt": paho.mqtt,
+                                                  "paho.mqtt.client": fake})
+        self.mods.start()
+        self.addCleanup(self.mods.stop)
+
+    def test_foreign_host_is_refused_and_never_contacted(self):
+        r = self.c.post("/api/mqtt/test", headers=_auth(), json={"host": "attacker.example"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(_FakeClient.instances, [])
+
+    def test_uses_saved_broker(self):
+        r = self.c.post("/api/mqtt/test", headers=_auth(), json={})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(_FakeClient.instances[0].connected_to, ("10.0.0.5", 1883))
+        self.assertEqual(_FakeClient.instances[0].creds, ("ha", "brokerpw"))
+
+    def test_same_host_is_fine(self):
+        r = self.c.post("/api/mqtt/test", headers=_auth(), json={"host": "10.0.0.5"})
+        self.assertEqual(r.status_code, 200)
+
+
+class TalkGateTests(WebappTestBase):
+    def setUp(self):
+        super().setUp()
+        cfg = cs.load_config()
+        cfg["cameras"] = [dict(cs.CAMERA_DEFAULTS, name="nursery", uid="U")]
+        cs.save_config(cfg)
+
+    def test_talk_play_and_sound_upload_disabled_by_default(self):
+        self.assertFalse(webapp.TALK_ENABLED)
+        r1 = self.c.post("/api/talk/nursery", headers=_auth(),
+                         data={"audio": (io.BytesIO(b"x"), "a.webm")},
+                         content_type="multipart/form-data")
+        r2 = self.c.post("/api/play/nursery", headers=_auth(), json={"file": "a.mp3"})
+        r3 = self.c.post("/api/sounds", headers=_auth(),
+                         data={"file": (io.BytesIO(b"x"), "a.mp3")},
+                         content_type="multipart/form-data")
+        for r in (r1, r2, r3):
+            self.assertEqual(r.status_code, 403)
+        self.assertFalse(os.path.isdir(os.path.join(self.dir, "sounds")))
 
 
 if __name__ == "__main__":

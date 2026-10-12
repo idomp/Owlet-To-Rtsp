@@ -62,9 +62,10 @@ briefly unreachable. Opt out with `OWLET_REFRESH_KMS=0`.
 camera (served by the control panel on `:8088`). Handy for dashboards/Home
 Assistant `camera` entities.
 
-### 🔒 Optional Web UI auth
-Set `OWLET_UI_USER` and `OWLET_UI_PASS` to require HTTP Basic auth on the control
-panel. Off by default.
+### 🔒 Web UI auth (always on)
+HTTP Basic auth on the control panel is mandatory. Set `OWLET_UI_USER` and
+`OWLET_UI_PASS`; otherwise a random password is generated once into
+`/config/secrets/ui.json` (mode 0600). The UI never runs open.
 
 ---
 
@@ -73,7 +74,8 @@ panel. Off by default.
 | Var | Default | Meaning |
 |---|---|---|
 | `OWLET_REFRESH_KMS` | `1` | re‑fetch the camera key from Owlet on every (re)connect |
-| `OWLET_UI_USER` / `OWLET_UI_PASS` | *(unset)* | require Basic auth on the control panel |
+| `OWLET_UI_USER` / `OWLET_UI_PASS` | `admin` / *(generated)* | control‑panel Basic auth (always on) |
+| `OWLET_TALK` | `0` | `1` enables talk‑back / streamed sound playback |
 | `OWLET_KEEPALIVE` | `1` | hold one warm session per camera (leave on) |
 | `OWLET_VITALS_POLL` | `1` | continuously read sock vitals + cam sensors |
 | `OWLET_VITALS_INTERVAL` | `15` | seconds between sock vitals polls |

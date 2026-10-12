@@ -5,7 +5,7 @@
 #   open  https://<host>:8088
 #
 # Exposure model (secure by default):
-#   * Only the control panel (8088) is published.
+#   * Only the control panel (8088, HTTP Basic auth always on) is published.
 #   * go2rtc's HTTP API (1984) listens on container loopback only. It can rewrite
 #     its own config and run commands, so it is never published.
 #   * RTSP (8554) is NOT published. Frigate pulls it over the shared Docker
@@ -30,6 +30,11 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
+      # Control-panel auth is always on. Without these, a random password is
+      # generated into /config/secrets/ui.json (user "admin").
+      OWLET_UI_USER: "${OWLET_UI_USER:-admin}"
+      OWLET_UI_PASS: "${OWLET_UI_PASS:?set OWLET_UI_PASS (control panel password)}"
+      OWLET_TALK: "0"                 # talk-back / streamed sound playback endpoints disabled
       GO2RTC_USER: "${GO2RTC_USER:-owlet}"
       GO2RTC_PASS: "${GO2RTC_PASS:?set GO2RTC_PASS (RTSP password Frigate uses)}"
     volumes:

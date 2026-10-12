@@ -62,9 +62,19 @@ PUBLIC_HTTP_PORT = os.environ.get("PUBLIC_HTTP_PORT", "1984")
 PUBLIC_RTSP_PORT = os.environ.get("PUBLIC_RTSP_PORT", "8554")
 PUBLIC_WEBRTC_PORT = os.environ.get("PUBLIC_WEBRTC_PORT", "8555")
 
-# Optional Web UI auth (off by default). Set both to require HTTP Basic auth.
+# Web UI auth is ALWAYS on. Credentials, first match wins:
+#   1. OWLET_UI_USER + OWLET_UI_PASS (env)
+#   2. ui_user + ui_pass saved from the UI
+#   3. a random password generated once into <config>/secrets/ui.json (0600),
+#      username "admin". Its location (never the password) is logged at boot.
+# If none of these can be had, the UI refuses to start / answers 503.
 UI_USER = os.environ.get("OWLET_UI_USER", "")
 UI_PASS = os.environ.get("OWLET_UI_PASS", "")
+UI_SECRET_PATH = os.path.join(cs.SECRETS_DIR, "ui.json")
+
+# Talk-back and streamed sound playback inject audio into the nursery speaker.
+# Disabled unless explicitly enabled with OWLET_TALK=1.
+TALK_ENABLED = os.environ.get("OWLET_TALK", "0") == "1"
 
 LOG: deque[str] = deque(maxlen=6000)
 STATE: dict = {"candidates": [], "devices": None, "busy": False, "cam_busy": set()}
@@ -88,6 +98,32 @@ def log(msg: str = "") -> None:
 _AUTH = {"t": 0.0, "user": "", "pass": ""}
 
 
+def _generated_ui_creds(create: bool = True) -> tuple[str, str]:
+    """('admin', <random>) persisted in UI_SECRET_PATH; ('', '') if it can't be
+    read or created."""
+    try:
+        with open(UI_SECRET_PATH) as fh:
+            d = json.load(fh)
+        if d.get("username") and d.get("password"):
+            return str(d["username"]), str(d["password"])
+    except (OSError, ValueError):
+        pass
+    if not create:
+        return "", ""
+    import secrets as _secrets
+    u, p = "admin", _secrets.token_urlsafe(18)
+    try:
+        os.makedirs(os.path.dirname(UI_SECRET_PATH), mode=0o700, exist_ok=True)
+        cs._atomic_write(UI_SECRET_PATH, json.dumps({"username": u, "password": p}),  # noqa: SLF001
+                         mode=0o600)
+    except OSError:
+        return "", ""
+    log(f"control panel: no OWLET_UI_USER/OWLET_UI_PASS set — generated a password for "
+        f"user '{u}' in {UI_SECRET_PATH} (read it with `docker exec <container> cat "
+        f"{UI_SECRET_PATH}`)")
+    return u, p
+
+
 def _ui_creds() -> tuple[str, str]:
     if UI_USER and UI_PASS:
         return UI_USER, UI_PASS
@@ -99,6 +135,8 @@ def _ui_creds() -> tuple[str, str]:
             _AUTH["pass"] = cfg.get("ui_pass") or ""
         except Exception:  # noqa: BLE001
             pass
+        if not (_AUTH["user"] and _AUTH["pass"]):
+            _AUTH["user"], _AUTH["pass"] = _generated_ui_creds()
         _AUTH["t"] = now
     return _AUTH["user"], _AUTH["pass"]
 
@@ -113,7 +151,8 @@ def _auth():
             return Response("cross-origin request blocked", 403)
     user, pw = _ui_creds()
     if not (user and pw):
-        return None
+        # Never fall open: no credentials means nobody gets in.
+        return Response("control panel locked: set OWLET_UI_USER and OWLET_UI_PASS", 503)
     a = request.authorization
     if a and hmac.compare_digest(a.username or "", user) \
             and hmac.compare_digest(a.password or "", pw):
@@ -209,15 +248,24 @@ def post_mqtt():
 
 @app.post("/api/mqtt/test")
 def test_mqtt():
+    """Test the CONFIGURED broker only. The host/port always come from the saved
+    settings (or OWLET_MQTT_* env); a caller-supplied host is refused, so this
+    endpoint can't be used to send the saved MQTT password to another machine
+    or to probe the LAN. Succeeds only on a CONNACK with return code 0."""
     incoming = request.json or {}
-    cfg = cs.load_config()
-    saved = dict(cs.MQTT_DEFAULTS); saved.update(cfg.get("mqtt") or {})
-    host = incoming.get("host") or saved.get("host")
+    eff = cs.mqtt_settings(cs.load_config())
+    host = (eff.get("host") or "").strip()
     if not host:
-        return jsonify({"ok": False, "error": "enter a broker host first"}), 400
-    port = int(incoming.get("port") or saved.get("port") or 1883)
-    user = incoming.get("user") or saved.get("user") or ""
-    pw = saved.get("password") if incoming.get("password") in (None, "********") \
+        return jsonify({"ok": False, "error": "save a broker host first"}), 400
+    port = int(eff.get("port") or 1883)
+    asked = str(incoming.get("host") or "").strip()
+    if asked and asked != host:
+        return jsonify({"ok": False, "error": "save the broker settings first — the "
+                                              "test only connects to the saved broker"}), 400
+    if str(incoming.get("port") or "").strip() not in ("", str(port)):
+        return jsonify({"ok": False, "error": "save the broker settings first"}), 400
+    user = incoming.get("user") or eff.get("user") or ""
+    pw = eff.get("password") if incoming.get("password") in (None, "", "********") \
         else incoming.get("password")
     try:
         import paho.mqtt.client as mqtt
@@ -229,8 +277,21 @@ def test_mqtt():
             if hasattr(mqtt, "CallbackAPIVersion") else mqtt.Client()
         if user:
             c.username_pw_set(user, pw or "")
+        res: dict = {}
+        c.on_connect = lambda _c, _u, _f, rc, *_a: res.setdefault("rc", rc)
         c.connect(host, port, 5)
-        c.disconnect()
+        end = time.time() + 5
+        while "rc" not in res and time.time() < end:
+            c.loop(timeout=0.2)
+        try:
+            c.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        rc = res.get("rc")
+        if rc is None:
+            return jsonify({"ok": False, "error": "no CONNACK from broker (timeout)"}), 502
+        if rc != 0:
+            return jsonify({"ok": False, "error": f"broker refused the connection (rc={rc})"}), 502
         return jsonify({"ok": True, "msg": f"Connected to {host}:{port} ✓"})
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(e)}), 502
@@ -290,7 +351,7 @@ def list_cameras():
             "name": c["name"],
             "camera_dsn": c.get("camera_dsn", ""),
             "uid": c.get("uid", ""),
-            "authkey": c.get("authkey", ""),
+            "authkey": _mask_pw(c.get("authkey")),   # never returned in clear
             "av_password": _mask_pw(c.get("av_password")),
             "av_security_mode": c.get("av_security_mode", ""),
             "have_key": bool(c.get("uid") and c.get("authkey")),
@@ -343,8 +404,8 @@ def update_camera(name):
         if k not in body:
             continue
         val = body[k]
-        if k == "av_password" and val == "********":
-            continue
+        if k in ("av_password", "authkey") and val == "********":
+            continue   # masked value echoed back by the UI = unchanged
         if k == "name":
             val = cs.slugify(val, cam["name"])
         cam[k] = val
@@ -756,6 +817,7 @@ def status():
         "rtsp_port": PUBLIC_RTSP_PORT, "http_port": PUBLIC_HTTP_PORT,
         "webrtc_port": PUBLIC_WEBRTC_PORT,
         "watchdog": _watchdog_state(),
+        "talk_enabled": TALK_ENABLED,
     })
 
 
@@ -1029,6 +1091,8 @@ def list_sounds():
 @app.post("/api/sounds")
 def upload_sound():
     from werkzeug.utils import secure_filename
+    if not TALK_ENABLED:
+        return _talk_disabled()
     if (request.content_length or 0) > SOUND_MAX:
         return jsonify({"ok": False, "error": "file too large"}), 413
     f = request.files.get("file")
@@ -1056,6 +1120,11 @@ def delete_sound(fname):
     return jsonify({"ok": True})
 
 
+def _talk_disabled():
+    return jsonify({"ok": False, "error": "talk-back / sound playback is disabled "
+                    "(set OWLET_TALK=1 to enable)"}), 403
+
+
 def _schedule_stop(camera, proc, seconds: float):
     """Stop THIS playback process after `seconds` (the streamed-audio sleep timer).
     The camera-side timer_ms only applies to the app's native player, so for
@@ -1075,6 +1144,8 @@ def _schedule_stop(camera, proc, seconds: float):
 @app.post("/api/play/<camera>")
 def play_sound(camera):
     from werkzeug.utils import secure_filename
+    if not TALK_ENABLED:
+        return _talk_disabled()
     if not _known_camera(camera):
         return jsonify({"ok": False, "error": "no such camera"}), 404
     body = request.json or {}
@@ -1103,6 +1174,8 @@ def play_sound(camera):
 @app.post("/api/talk/<camera>")
 def talk(camera):
     """Play a recorded mic clip out the camera speaker (hold-to-talk)."""
+    if not TALK_ENABLED:
+        return _talk_disabled()
     if not _known_camera(camera):
         return jsonify({"ok": False, "error": "no such camera"}), 404
     if (request.content_length or 0) > SOUND_MAX:
@@ -1359,6 +1432,16 @@ if __name__ == "__main__":
     if not os.path.exists(cs.CONFIG_PATH):
         if not save_config(cs.load_config()):
             log("starting the UI anyway so you can fix the config-folder permission.")
+    # Auth is mandatory: resolve (or generate) the credentials now and refuse to
+    # serve at all if there are none — never an open control panel.
+    if not all(_ui_creds()):
+        import sys as _sys
+        print("[webapp] REFUSING TO START: no control-panel credentials. Set "
+              "OWLET_UI_USER and OWLET_UI_PASS (the generated fallback in "
+              f"{UI_SECRET_PATH} could not be written).", file=_sys.stderr, flush=True)
+        _sys.exit(1)
+    for _ln in list(LOG):
+        print(_ln, flush=True)   # surface the boot-time auth notice in docker logs
     # Serve on HTTPS so browsers allow microphone access (getUserMedia requires
     # a secure context — HTTPS or localhost — on modern browsers).
     # The cert is generated by start-bionic.sh; if it's missing we try the

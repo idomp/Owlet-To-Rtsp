@@ -289,6 +289,8 @@ Everything's set in the web UI; these env vars override or tune it:
 
 | Var | Default | Meaning |
 |---|---|---|
+| `OWLET_UI_USER` / `OWLET_UI_PASS` | `admin` / *(generated)* | control‑panel login. Auth is **always on**; with no password set, a random one is written to `/config/secrets/ui.json` (0600) and only that path is logged |
+| `OWLET_TALK` | `0` | `1` enables talk‑back and streamed sound playback into the nursery speaker (`/api/talk`, `/api/play`, sound uploads) |
 | `GO2RTC_USER` / `GO2RTC_PASS` | `owlet` / *(generated)* | credentials go2rtc requires on RTSP and its API for every non‑loopback client (`api.username`/`api.password`, `rtsp.username`/`rtsp.password`). Unset password = random one kept in `/config/secrets/go2rtc.json` (0600) |
 | `GO2RTC_API_LISTEN` | `127.0.0.1:1984` | go2rtc API bind address. Keep it on loopback; `:1984` only if you publish it deliberately |
 | `GO2RTC_RTSP_LISTEN` | `:8554` | RTSP bind address inside the container (reached by Frigate over the shared Docker network) |
