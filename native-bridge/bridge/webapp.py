@@ -601,6 +601,12 @@ def _vitals_worker(cfg: dict):
 
 @app.post("/api/vitals/discover")
 def vitals_discover():
+    # Discovery runs the same Ayla snapshot as the sock poller, which WRITES
+    # APP_ACTIVE to the sock — only when the operator opted in.
+    if os.environ.get("OWLET_VITALS_POLL", "0") != "1":
+        return jsonify({"ok": False, "error": "sock cloud access is disabled "
+                                              "(OWLET_VITALS_POLL=0) — it writes APP_ACTIVE "
+                                              "to the sock"}), 403
     if STATE["busy"]:
         return jsonify({"error": "already running"}), 409
     cfg = cs.load_config()

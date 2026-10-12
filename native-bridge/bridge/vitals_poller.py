@@ -10,11 +10,16 @@ sensors and fan them out to everything that wants them:
   * /config/vitals/overlay-<cam>.txt -> the burned-in video HUD (read by ffmpeg
     drawtext). Written here so it's ready the moment the overlay is switched on.
 
-Sock vitals come from Owlet's Ayla cloud (needs APP_ACTIVE keep-alive, handled
-in OwletVitals). Cam sensors are written continuously by tutk_client from the
-live TUTK stream; we just merge them in.
+Two independent sources:
 
-Disable entirely with OWLET_VITALS_POLL=0.
+  * Camera room sensors (temperature, humidity, noise, brightness, Wi-Fi
+    RSSI) come from the camera's own P2P session: tutk_client reads them from
+    the video frame-info and the GET_REALTIME_DATA IOCTL and writes
+    /config/vitals/cam-<name>.json. Publishing those needs NO cloud and is ON
+    by default (OWLET_SENSOR_PUBLISH=0 turns this process off).
+  * Smart Sock vitals come from Owlet's Ayla cloud and require WRITING
+    APP_ACTIVE=1 to the sock every cycle. That poller is OFF by default; leave
+    it off unless you accept that (OWLET_VITALS_POLL=1 enables it).
 """
 
 from __future__ import annotations
@@ -323,72 +328,112 @@ def _read_cam_sidecars(now: float | None = None) -> list[dict]:
     return out
 
 
+def cloud_enabled() -> bool:
+    """The Ayla sock poller. OFF unless OWLET_VITALS_POLL=1: every cycle it
+    WRITES APP_ACTIVE=1 to each sock through Owlet's cloud and logs in to Ayla.
+    Leave it off unless you want sock vitals here and accept that."""
+    return os.environ.get("OWLET_VITALS_POLL", "0") == "1"
+
+
+def publisher_enabled() -> bool:
+    """The local publisher (camera room sensors -> snapshot/HUD/MQTT). It talks
+    to no cloud; OWLET_SENSOR_PUBLISH=0 turns it off."""
+    return os.environ.get("OWLET_SENSOR_PUBLISH", "1") != "0"
+
+
+class _Cloud:
+    """Sock vitals from the Ayla cloud, polled on its own schedule so a cloud
+    outage (and its backoff) never delays the local camera publishing."""
+
+    def __init__(self, log):
+        self.log = log
+        self.api = None
+        self.key = None
+        self.fails = 0
+        self.next_at = 0.0
+
+    def poll(self, cfg: dict, now: float) -> list[dict]:
+        if not cloud_enabled() or not (cfg.get("email") and cfg.get("password")):
+            self.api = None
+            return []
+        if now < self.next_at:
+            return []
+        from owlet_api import OwletAPI, OwletError
+        from owlet_vitals import OwletVitals
+        key = (cfg.get("region"), cfg.get("email"), cfg.get("password"))
+        if key != self.key:          # account changed in the UI -> new session
+            self.api, self.key = None, key
+        try:
+            if self.api is None:
+                self.api = OwletAPI(cfg["region"], cfg["email"], cfg["password"])
+            devices = OwletVitals(self.api).snapshot()
+            self.fails = 0
+        except OwletError as e:
+            # auth/login failure -> drop the session and re-auth next time
+            self.log(f"[vitals] login error: {e}")
+            self.api = None
+            self.fails += 1
+            devices = []
+        except Exception as e:  # noqa: BLE001
+            # A 401/403 means the Ayla access_token expired -> drop the session
+            # and re-auth (raise_for_status() throws requests.HTTPError, not an
+            # OwletError). Anything else keeps the warm session and backs off.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (401, 403) or " 401 " in f" {e} " or " 403 " in f" {e} ":
+                self.log(f"[vitals] auth expired ({status or 'HTTP'}) -> re-authenticating")
+                self.api = None
+            else:
+                self.log(f"[vitals] poll error: {e}")
+            self.fails += 1
+            devices = []
+        # exponential backoff on sustained cloud failure (cap ~5 min)
+        self.next_at = now + (POLL if self.fails == 0
+                              else min(POLL * (2 ** min(self.fails, 5)), 300))
+        return devices
+
+
+def poll_once(mq: "_Mqtt", cloud: _Cloud, log, now: float | None = None) -> list[dict]:
+    """One cycle: (optional) sock cloud poll + local camera sidecars ->
+    snapshot.json, HUD overlay text and MQTT. Returns the devices handled."""
+    now = time.time() if now is None else now
+    cfg = cs.load_config()
+    mq.ensure(cs.mqtt_settings(cfg))   # pick up UI changes live
+    devices = cloud.poll(cfg, now)
+    # merge live cam sensors from tutk_client sidecars (cloud-independent)
+    cam_devs = _read_cam_sidecars(now=now)
+    seen = {d.get("dsn") for d in devices}
+    devices += [c for c in cam_devs if c["dsn"] not in seen]
+
+    # Always refresh the snapshot (even when empty) so /api/vitals can tell
+    # "no data yet" from "stale": it carries ts + an ok flag every loop.
+    try:
+        os.makedirs(cs.VITALS_DIR, mode=0o700, exist_ok=True)
+        cs._atomic_write(SNAP, json.dumps({"ts": now, "ok": bool(devices),  # noqa: SLF001
+                                           "devices": devices}))
+    except OSError as e:
+        log(f"[vitals] snapshot write failed: {e}")
+    if devices:
+        _write_overlays(devices, log)
+        for d in devices:
+            mq.publish_device(d)
+    return devices
+
+
 def main() -> None:
     def log(m):
         print(time.strftime("%Y-%m-%d %H:%M:%S"), m, flush=True)
 
-    if os.environ.get("OWLET_VITALS_POLL", "1") == "0":
+    if not publisher_enabled():
         return
+    log("[vitals] camera room sensors -> snapshot/HUD/MQTT (local only); sock cloud "
+        "poller " + ("ON (writes APP_ACTIVE to the sock)" if cloud_enabled()
+                     else "off (OWLET_VITALS_POLL=0)"))
     time.sleep(12)  # let webapp + first stream come up
-    from owlet_api import OwletAPI, OwletError
-    from owlet_vitals import OwletVitals
-
     mq = _Mqtt(log)
-    api = None
-    fails = 0   # consecutive cloud failures -> backoff (don't hammer login)
+    cloud = _Cloud(log)
     while True:
-        devices: list[dict] = []
-        cfg = cs.load_config()
-        mq.ensure(cs.mqtt_settings(cfg))   # pick up UI changes live
-        if cfg.get("email") and cfg.get("password"):
-            try:
-                if api is None:
-                    api = OwletAPI(cfg["region"], cfg["email"], cfg["password"])
-                devices = OwletVitals(api).snapshot()
-                fails = 0
-            except OwletError as e:
-                # auth/login failure -> drop the session and re-auth next time
-                log(f"[vitals] login error: {e}")
-                api = None
-                fails += 1
-            except Exception as e:  # noqa: BLE001
-                # A 401/403 means the Ayla access_token expired -> we MUST drop the
-                # session and re-auth. (_ayla_get calls raise_for_status(), which
-                # throws requests.HTTPError — NOT an OwletError — so an expired
-                # token lands here, not in the OwletError branch above, and would
-                # otherwise keep the dead token forever.) Anything else
-                # (network/JSON blip) keeps the warm session and just backs off, so
-                # we don't hammer login and risk Owlet rate-limiting the account.
-                status = getattr(getattr(e, "response", None), "status_code", None)
-                if status in (401, 403) or " 401 " in f" {e} " or " 403 " in f" {e} ":
-                    log(f"[vitals] auth expired ({status or 'HTTP'}) -> re-authenticating")
-                    api = None
-                else:
-                    log(f"[vitals] poll error: {e}")
-                fails += 1
-
-        # merge live cam sensors from tutk_client sidecars (cloud-independent)
-        cam_devs = _read_cam_sidecars()
-        seen = {d.get("dsn") for d in devices}
-        devices += [c for c in cam_devs if c["dsn"] not in seen]
-
-        # Always refresh the snapshot (even when empty) so /api/vitals can tell
-        # "no data yet" from "stale": it carries ts + an ok flag every loop.
-        try:
-            os.makedirs(cs.VITALS_DIR, exist_ok=True)
-            with open(SNAP + ".tmp", "w") as f:
-                json.dump({"ts": time.time(), "ok": bool(devices), "devices": devices}, f)
-            os.replace(SNAP + ".tmp", SNAP)
-        except OSError as e:
-            log(f"[vitals] snapshot write failed: {e}")
-        if devices:
-            _write_overlays(devices, log)
-            for d in devices:
-                mq.publish_device(d)
-
-        # exponential backoff on sustained cloud failure (cap ~5 min)
-        delay = POLL if fails == 0 else min(POLL * (2 ** min(fails, 5)), 300)
-        time.sleep(delay)
+        poll_once(mq, cloud, log)
+        time.sleep(POLL)
 
 
 if __name__ == "__main__":

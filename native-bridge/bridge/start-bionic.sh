@@ -91,10 +91,12 @@ if [ "${OWLET_KEEPALIVE:-1}" = "1" ]; then
   python3 /app/keepalive.py &
 fi
 
-# Continuously read sock vitals + cam sensors -> snapshot.json (web UI + your
-# app's /api/vitals), the burned-in overlay text, and Home Assistant (MQTT, if
-# OWLET_MQTT_HOST is set). Set OWLET_VITALS_POLL=0 to disable.
-if [ "${OWLET_VITALS_POLL:-1}" = "1" ]; then
+# Publish the camera's room sensors (from its own P2P session, no cloud) ->
+# snapshot.json (web UI + /api/vitals), the burned-in overlay text and Home
+# Assistant (MQTT, if configured). OWLET_SENSOR_PUBLISH=0 disables it.
+# The Smart Sock cloud poller inside it is separate and OFF unless
+# OWLET_VITALS_POLL=1 -- it WRITES APP_ACTIVE to the sock every cycle; leave it off.
+if [ "${OWLET_SENSOR_PUBLISH:-1}" != "0" ]; then
   python3 /app/vitals_poller.py &
 fi
 

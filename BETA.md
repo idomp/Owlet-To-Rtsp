@@ -78,8 +78,10 @@ HTTP Basic auth on the control panel is mandatory. Set `OWLET_UI_USER` and
 | `OWLET_UI_USER` / `OWLET_UI_PASS` | `admin` / *(generated)* | control‑panel Basic auth (always on) |
 | `OWLET_TALK` | `0` | `1` enables talk‑back / streamed sound playback |
 | `OWLET_KEEPALIVE` | `1` | hold one warm session per camera (leave on) |
-| `OWLET_VITALS_POLL` | `1` | continuously read sock vitals + cam sensors |
-| `OWLET_VITALS_INTERVAL` | `15` | seconds between sock vitals polls |
+| `OWLET_VITALS_POLL` | `0` | Smart Sock cloud poller. **Writes `APP_ACTIVE=1` to the sock through Owlet's cloud every cycle — leave off.** Camera room sensors do not need it |
+| `OWLET_SENSOR_PUBLISH` | `1` | publish the camera's room sensors (from its own P2P session, no cloud) to snapshot/HUD/MQTT |
+| `OWLET_SENSOR_STALE` | `60` | seconds after which a room‑sensor reading is no longer published as current |
+| `OWLET_VITALS_INTERVAL` | `15` | seconds between publish cycles (and sock polls, if enabled) |
 | `OWLET_SENSORS` | `1` | publish cam room sensors (temp/humidity/noise/…) |
 | `OWLET_WEBRTC_CANDIDATE` | *(unset)* | `<host-ip>:8555` for sub‑second WebRTC from phones/other hosts |
 | `OWLET_MQTT_HOST` … | *(unset)* | Home Assistant MQTT — **easier to set in the UI** (🏠 card) |
