@@ -290,6 +290,9 @@ Everything's set in the web UI; these env vars override or tune it:
 | Var | Default | Meaning |
 |---|---|---|
 | `OWLET_UI_USER` / `OWLET_UI_PASS` | `admin` / *(generated)* | control‑panel login. Auth is **always on**; with no password set, a random one is written to `/config/secrets/ui.json` (0600) and only that path is logged |
+| `OWLET_REFRESH_KMS` | `1` | `0` = never log in to the Owlet cloud automatically; streams use only the saved camera key |
+| `OWLET_LOGIN_BACKOFF` / `OWLET_LOGIN_BACKOFF_MAX` / `OWLET_LOGIN_MAX_ATTEMPTS` | `60` / `21600` / `5` | automatic key refresh is rare by design: the saved key is used first; a refresh (one Firebase password login + KMS fetch) only follows a connect / AV‑login failure, at most **once per stream start**, with account‑wide exponential backoff (60 s, 120 s, 240 s …, max 6 h). After **5** attempts without a session that delivers video, automatic logins stop until a manual *Connect / refresh key* succeeds. State: `/config/secrets/login-guard.json` |
+| `OWLET_FORGET_ACCOUNT` | `0` | `1` = once every camera has a saved key, blank the Owlet email/password in `/config/owlet.yaml` (also settable as `"forget_account": "1"` there). No cloud logins can happen afterwards; to re‑provision, unset it and re‑enter the account |
 | `OWLET_TALK` | `0` | `1` enables talk‑back and streamed sound playback into the nursery speaker (`/api/talk`, `/api/play`, sound uploads) |
 | `GO2RTC_USER` / `GO2RTC_PASS` | `owlet` / *(generated)* | credentials go2rtc requires on RTSP and its API for every non‑loopback client (`api.username`/`api.password`, `rtsp.username`/`rtsp.password`). Unset password = random one kept in `/config/secrets/go2rtc.json` (0600) |
 | `GO2RTC_API_LISTEN` | `127.0.0.1:1984` | go2rtc API bind address. Keep it on loopback; `:1984` only if you publish it deliberately |

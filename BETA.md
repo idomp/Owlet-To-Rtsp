@@ -51,11 +51,12 @@ Add as many Owlet cams as you want — each becomes its own RTSP stream.
 > config) keeps working untouched.
 
 ### 🔁 Self‑healing streams (also shipped to `:latest`)
-The stream now re‑fetches a **fresh camera key** from the Owlet cloud on every
-(re)connect — the same thing the *Connect & Diagnose* button does, but automatic.
-After a container update, power blip, or Frigate restart the camera comes back on
-its own; no more manual re‑diagnose. Falls back to the saved key if the cloud is
-briefly unreachable. Opt out with `OWLET_REFRESH_KMS=0`.
+Streams use the **saved camera key** and persist any refreshed one. A cloud
+refresh (Firebase password login + KMS fetch) only follows a connect / AV‑login
+failure: at most once per stream start, with account‑wide exponential backoff
+and a hard cap of 5 attempts (see `OWLET_LOGIN_*` in the README). Turn automatic
+refresh off entirely with `OWLET_REFRESH_KMS=0`; drop the stored account after
+provisioning with `OWLET_FORGET_ACCOUNT=1`.
 
 ### 📸 Snapshot endpoints
 `GET /img/<name>.jpg` and `GET /snapshot/<name>.jpg` return a still JPEG for a
@@ -73,7 +74,7 @@ HTTP Basic auth on the control panel is mandatory. Set `OWLET_UI_USER` and
 
 | Var | Default | Meaning |
 |---|---|---|
-| `OWLET_REFRESH_KMS` | `1` | re‑fetch the camera key from Owlet on every (re)connect |
+| `OWLET_REFRESH_KMS` | `1` | allow rate‑limited automatic key refresh after a connect failure (`0` = never) |
 | `OWLET_UI_USER` / `OWLET_UI_PASS` | `admin` / *(generated)* | control‑panel Basic auth (always on) |
 | `OWLET_TALK` | `0` | `1` enables talk‑back / streamed sound playback |
 | `OWLET_KEEPALIVE` | `1` | hold one warm session per camera (leave on) |

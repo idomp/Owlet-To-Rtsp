@@ -1409,6 +1409,7 @@ def stream_once(uid: str, sec_mode: int) -> int:
                 # 2 MB .raw copy of the whole buffer every frame (matters at 25fps).
                 out.write(memoryview(buf)[:actual.value]); out.flush()
                 frames += 1
+                _HAD_VIDEO[0] = True
                 last_data = time.time()
                 vclock["video_at"] = last_data
                 vclock["frames"] = frames
@@ -1639,27 +1640,53 @@ def av_client_start(av: CDLL, session: int, mode: int) -> int:
     return av_idx
 
 
+# Login-storm brake (see login_guard.py): at most ONE automatic Firebase
+# password login per stream process, and only when the account-wide guard
+# allows it (exponential backoff, hard cap OWLET_LOGIN_MAX_ATTEMPTS).
+MAX_LOGINS_PER_START = 1
+_LOGINS_THIS_PROCESS = [0]
+_HAD_VIDEO = [False]           # set by stream_once on the first forwarded frame
+
+
+def _refresh_allowed() -> bool:
+    return os.environ.get("OWLET_REFRESH_KMS", "1") != "0"
+
+
 def resolve_creds(refresh: bool = True) -> str:
-    """Return the camera UID, FIRST refreshing UID/AuthKey/AV-password from the
-    Owlet KMS so a *stale* saved key never blocks a (re)connect.
+    """Return the camera UID, optionally refreshing UID/AuthKey/AV-password
+    from the Owlet KMS first.
 
-    This is exactly the fetch the web UI's "Connect & Diagnose" performs. Doing it
-    automatically on every stream (re)start means that after a container update,
-    a power blip, or a Frigate reconnect, the camera comes back on its own — no
-    manual re-diagnose. The Owlet camera key can rotate and the cam also holds its
-    single P2P slot for ~20s after the previous container dies, so reconnecting
-    with the old key used to fail until someone re-fetched the key by hand.
-
-    If the Owlet cloud is briefly unreachable we fall back to the saved key, so a
-    transient outage doesn't kill an otherwise-working stream. Set
-    OWLET_REFRESH_KMS=0 to skip the refresh and use only the saved key.
+    The saved key is the default. A cloud refresh (a full Firebase *password*
+    login + KMS fetch) happens only when ALL of these hold:
+      * `refresh` (main() asks only at a start with no saved UID, or after a
+        connect / AV-login failure that a rotated key could explain);
+      * OWLET_REFRESH_KMS is not "0" and DSN + account credentials exist;
+      * this process has not used its one login yet (MAX_LOGINS_PER_START);
+      * login_guard allows it (account-wide exponential backoff + hard cap,
+        shared by every stream process and surviving relaunches).
+    A fetched key is persisted to the config (config_store.persist_camera_key),
+    so later starts and reconnects reuse it instead of logging in again.
     """
-    global AUTHKEY, AV_PASSWORD
+    global AUTHKEY, AV_PASSWORD, UID
     dsn = os.environ.get("OWLET_CAMERA_DSN", "").strip()
     email = os.environ.get("OWLET_EMAIL")
     pw = os.environ.get("OWLET_PASSWORD")
     region = os.environ.get("OWLET_REGION", "world")
-    if refresh and os.environ.get("OWLET_REFRESH_KMS", "1") != "0" and dsn and email and pw:
+    want = refresh and _refresh_allowed() and dsn and email and pw
+    if want and _LOGINS_THIS_PROCESS[0] >= MAX_LOGINS_PER_START:
+        log("KMS refresh skipped: this stream start already used its one login")
+        want = False
+    if want:
+        try:
+            import login_guard
+            ok, why = login_guard.try_acquire()
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, f"login guard error: {e}"
+        if not ok:
+            log(f"KMS refresh skipped ({why}); using the saved key")
+            want = False
+    if want:
+        _LOGINS_THIS_PROCESS[0] += 1
         try:
             from owlet_api import OwletAPI
             api = OwletAPI(region, email, pw, log=lambda m: log(m))
@@ -1669,15 +1696,38 @@ def resolve_creds(refresh: bool = True) -> str:
                     AUTHKEY = creds["authkey"]
                 if creds.get("av_password"):
                     AV_PASSWORD = creds["av_password"].encode()
-                log(f"refreshed camera key from KMS (uid={creds['uid']})")
+                log("refreshed camera key from KMS")
+                UID = creds["uid"]   # later fallbacks reuse the fresh key
+                _persist_key(creds)
                 return creds["uid"]
         except Exception as e:  # noqa: BLE001
             log(f"KMS refresh failed ({e}); falling back to the saved key")
     if UID:
         return UID
-    log("No OWLET_UID and KMS refresh unavailable. Set the Camera DSN + account "
-        "login in the UI.")
+    log("No saved camera UID and no cloud refresh allowed right now. Set the Camera "
+        "DSN + account login in the UI and use 'Connect / refresh key'.")
+    time.sleep(30)   # don't let go2rtc relaunch us in a tight loop
     sys.exit(1)
+
+
+def _persist_key(creds: dict) -> None:
+    """Save a fetched key so restarts/reconnects reuse it; if the config asks
+    for it (OWLET_FORGET_ACCOUNT), the account credentials are blanked then and
+    this process stops being able to log in at all."""
+    name = os.environ.get("OWLET_CAMERA_NAME", "")
+    if not name:
+        return
+    try:
+        import config_store as cs
+        cs.persist_camera_key(name, creds)
+        cfg = cs.load_config()
+        if not (cfg.get("email") and cfg.get("password")):
+            os.environ.pop("OWLET_EMAIL", None)
+            os.environ.pop("OWLET_PASSWORD", None)
+            log("account credentials removed from config (OWLET_FORGET_ACCOUNT) — "
+                "no further cloud logins")
+    except Exception as e:  # noqa: BLE001
+        log(f"could not persist the refreshed key: {e}")
 
 
 def main() -> None:
@@ -1686,8 +1736,10 @@ def main() -> None:
     # cam holds the single P2P slot and the next connect is refused.
     import signal
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    uid = resolve_creds()                 # fresh key on first start
+    # Saved key first; log in at start only if there is no saved UID at all.
+    uid = resolve_creds(refresh=not UID)
     last_kms = time.monotonic()
+    video_recorded = False
     # Security mode to try. If pinned via env, use only that; otherwise cycle
     # [Auto, Dtls, Simple] across reconnects — each on a FRESH session so a
     # failed DTLS handshake on one mode can't poison the next attempt.
@@ -1712,11 +1764,19 @@ def main() -> None:
                     "release its session before reconnecting")
             elif rc != 0:
                 log(f"exit rc={rc}; retry in 5s")
-            # On a connect/AV-login/no-video failure the saved key may be stale
-            # (rotated by Owlet, or the cam's single slot was still held) — pull a
-            # fresh one, rate-limited to once per 15s so a long camera outage doesn't
-            # hammer the Owlet cloud.
-            if rc in (4, 5, 6) and time.monotonic() - last_kms >= 15:
+            if _HAD_VIDEO[0] and not video_recorded:
+                # a session delivered video: the key works, re-arm the guard
+                video_recorded = True
+                try:
+                    import login_guard
+                    login_guard.record_success()
+                except Exception:  # noqa: BLE001
+                    pass
+            # Only a connect (4) or AV-login (5) failure can be a rotated key. A
+            # no-video session (6) is the camera's slot still being held — a new
+            # key can't fix that, so it never triggers a login. resolve_creds()
+            # enforces the one-login-per-start cap and the account-wide backoff.
+            if rc in (4, 5) and time.monotonic() - last_kms >= 15:
                 uid = resolve_creds()
                 last_kms = time.monotonic()
         except SystemExit:

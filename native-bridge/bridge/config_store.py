@@ -98,12 +98,12 @@ DEFAULT_CAM_NAME = "owlet"
 # Account-level settings (shared by every camera).
 ACCOUNT_FIELDS = ["region", "email", "password", "av_account",
                   "iotype_start", "av_channel", "license_key", "region_code",
-                  "webrtc_candidate", "ui_user", "ui_pass"]
+                  "webrtc_candidate", "ui_user", "ui_pass", "forget_account"]
 ACCOUNT_DEFAULTS: dict[str, str] = {
     "region": "world", "email": "", "password": "",
     "av_account": "admin", "iotype_start": "511", "av_channel": "0",
     "license_key": APP_LICENSE_KEY, "region_code": "3",
-    "webrtc_candidate": "", "ui_user": "", "ui_pass": "",
+    "webrtc_candidate": "", "ui_user": "", "ui_pass": "", "forget_account": "",
 }
 
 # Per-camera settings.
@@ -288,6 +288,72 @@ def save_config(cfg: dict, regenerate: bool = True) -> bool:
         except OSError:
             return False
     return True
+
+
+def _config_file_lock():
+    """Cross-process lock for read-modify-write of the config (the stream
+    processes persist refreshed keys while the web UI may be saving too)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        fd = None
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            fd = os.open(os.path.join(CONFIG_DIR, ".owlet.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except (OSError, ImportError):
+            pass
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return _cm()
+
+
+def forget_account_requested(cfg: dict) -> bool:
+    """OWLET_FORGET_ACCOUNT=1 (env) or "forget_account": "1" in owlet.yaml:
+    once every camera has a stored key, blank the Owlet email/password so no
+    further cloud logins can happen (the bridge then runs on the saved keys)."""
+    flag = os.environ.get("OWLET_FORGET_ACCOUNT") or str(cfg.get("forget_account") or "")
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
+def forget_account_if_keyed(cfg: dict) -> bool:
+    """Blank email/password in `cfg` (in place) if requested and every camera
+    already has a UID + AuthKey. Returns True if something was blanked."""
+    cams = cfg.get("cameras") or []
+    if not forget_account_requested(cfg) or not (cfg.get("email") or cfg.get("password")):
+        return False
+    if not cams or not all(c.get("uid") and c.get("authkey") for c in cams):
+        return False
+    cfg["email"] = ""
+    cfg["password"] = ""
+    return True
+
+
+def persist_camera_key(name: str, creds: dict) -> bool:
+    """Store a freshly fetched UID/AuthKey/AV password for camera `name` so
+    every later (re)start reuses it instead of logging in again. Applies
+    forget_account_if_keyed afterwards. Returns True if the config changed."""
+    with _config_file_lock():
+        cfg = load_config()
+        cam = find_camera(cfg, name)
+        if cam is None or not creds.get("uid"):
+            return False
+        changed = False
+        for k_cfg, k_new in (("uid", "uid"), ("authkey", "authkey"),
+                             ("av_password", "av_password")):
+            v = creds.get(k_new)
+            if v and cam.get(k_cfg) != v:
+                cam[k_cfg] = v
+                changed = True
+        changed = forget_account_if_keyed(cfg) or changed
+        if changed:
+            save_config(cfg, regenerate=True)
+        return changed
 
 
 def camera_env(account: dict, cam: dict) -> dict[str, str]:

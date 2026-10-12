@@ -480,9 +480,18 @@ def _camera_diagnose_worker(name: str):
         cam["authkey"] = creds.get("authkey") or ""
         if creds.get("av_password"):
             cam["av_password"] = creds["av_password"]
+        forgot = cs.forget_account_if_keyed(cfg)
         if save_config(cfg):
-            log(f"[{name}] camera key saved (uid={creds['uid']}); (re)starting stream.")
-            restart_go2rtc()
+            log(f"[{name}] camera key saved; (re)starting stream.")
+            if forgot:
+                log("account email/password removed (OWLET_FORGET_ACCOUNT) — the bridge "
+                    "now runs on the saved camera keys with no cloud logins.")
+            try:   # a deliberate, successful key fetch re-arms automatic refresh
+                import login_guard
+                login_guard.record_success()
+            except Exception:  # noqa: BLE001
+                pass
+            restart_go2rtc(force=True)
     finally:
         STATE["cam_busy"].discard(name)
 
