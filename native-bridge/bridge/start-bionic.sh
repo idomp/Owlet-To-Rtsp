@@ -4,12 +4,19 @@
 export PATH=/data/data/com.termux/files/usr/bin:/usr/local/bin:/usr/bin:/bin
 export LD_LIBRARY_PATH=/app/libs/x86_64:/data/data/com.termux/files/usr/lib
 
+# /config holds the Owlet password, camera keys, MQTT and RTSP credentials:
+# everything this container creates is private to its user (files 0600, dirs
+# 0700), and anything an older version left group/world-accessible is tightened.
+umask 077
+chmod -R go-rwx /config 2>/dev/null || true
+
 mkdir -p /config /config/vitals 2>/dev/null
 if [ ! -f /config/owlet.env ]; then
   if ! (echo "# owlet-bridge" > /config/owlet.env) 2>/dev/null; then
     echo "[owlet-bridge/bionic] WARN: /config is not writable by this container."
-    echo "[owlet-bridge/bionic]   Settings won't persist. On Unraid, run:"
-    echo "[owlet-bridge/bionic]     chmod -R 777 /mnt/user/appdata/owlet/config"
+    echo "[owlet-bridge/bionic]   Settings won't persist. The container runs as uid 1000; on Unraid run:"
+    echo "[owlet-bridge/bionic]     chown -R 1000:1000 /mnt/user/appdata/owlet && chmod -R u+rwX,go-rwx /mnt/user/appdata/owlet"
+    echo "[owlet-bridge/bionic]   (never chmod 777 — the folder holds your Owlet password and camera keys)"
     echo "[owlet-bridge/bionic]   then restart this container."
   fi
 fi

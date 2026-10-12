@@ -378,7 +378,7 @@ async function refreshStatus() {
         "Not found. Upload your Owlet <code>.apkm</code> (or <code>.apk</code>) below — "
         + "they're never bundled here, you supply the app you downloaded.");
   if (!s.config_writable) {
-    toastOnce("⛔ Config folder not writable — run chmod -R 777 on your appdata config folder and restart.");
+    toastOnce("⛔ Config folder not writable — chown it to uid 1000 (chown -R 1000:1000 + chmod -R u+rwX,go-rwx), never 777, then restart.");
   }
 }
 let _warned=false;

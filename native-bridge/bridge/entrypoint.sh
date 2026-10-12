@@ -2,6 +2,7 @@
 # Start the control-panel UI (:8088) and go2rtc (:1984/:8554) together.
 set -uo pipefail
 
+umask 077   # /config holds credentials: files 0600, dirs 0700
 mkdir -p /config
 
 # Seed an empty config so the exec source doesn't fail on first boot.

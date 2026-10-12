@@ -64,9 +64,30 @@ LogFn = Callable[[str], None]
 
 
 def _mask(s: str) -> str:
+    """Never reveal any character of a secret (token, AuthKey, password) —
+    the old first-4/last-3 form leaked partial tokens into logs."""
     if not s:
         return s
-    return s[:4] + "…" + s[-3:] if len(s) > 10 else "***"
+    return f"<redacted {len(s)} chars>"
+
+
+def mask_id(s: str) -> str:
+    """Identifiers (camera UID, email): enough to tell two apart, not to reuse."""
+    s = str(s or "")
+    if "@" in s:
+        user, _, dom = s.partition("@")
+        return (user[:1] + "***@" + dom) if user else "***"
+    return s[:4] + "…" + s[-2:] if len(s) > 8 else "***"
+
+
+SECRET_NAME_RE = re.compile(r"secret|token|pass|psk|auth|key|cred", re.I)
+
+
+def redact_props(props: dict) -> dict:
+    """Copy of a property map with secret-looking values masked (for logs and
+    the vitals snapshot file)."""
+    return {k: (_mask(str(v)) if SECRET_NAME_RE.search(str(k)) and v not in (None, "") else v)
+            for k, v in (props or {}).items()}
 
 
 class OwletError(Exception):
@@ -89,7 +110,7 @@ class OwletAPI:
 
     # -- step 1: Firebase ---------------------------------------------------
     def _firebase(self) -> str:
-        self.log(f"[1/4] Firebase verifyPassword as {self.email} ({self.region}) …")
+        self.log(f"[1/4] Firebase verifyPassword as {mask_id(self.email)} ({self.region}) …")
         r = self.s.post(
             FIREBASE_URL.format(key=self.cfg["firebase_key"]),
             json={"email": self.email, "password": self.password,
@@ -141,7 +162,7 @@ class OwletAPI:
         pw = d.get("password")
         if not uid:
             raise OwletError(f"KMS response had no tutkid: {list(d)}")
-        self.log(f"      OK uid={uid} authKey={_mask(authkey or '')} "
+        self.log(f"      OK uid={mask_id(uid)} authKey={_mask(authkey or '')} "
                  f"password={_mask(pw or '')}")
         return {"uid": uid, "authkey": authkey, "av_password": pw}
 

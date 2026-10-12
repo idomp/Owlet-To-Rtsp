@@ -41,8 +41,10 @@ native-bridge/bridge/extract-libs.sh /path/to/owlet.apk x86_64
 
 **Prebuilt image (terminal):**
 ```bash
-docker run -d --name owlet-bridge --restart unless-stopped \
-  -p 8088:8088 -p 1984:1984 -p 8554:8554 -p 8555:8555/tcp -p 8555:8555/udp \
+docker network create owlet-net   # once; attach Frigate to it too
+docker run -d --name owlet-bridge --restart unless-stopped --init --network owlet-net \
+  -p 8088:8088 \
+  -e OWLET_UI_PASS='<ui password>' -e GO2RTC_PASS='<rtsp password>' \
   -v /mnt/user/appdata/owlet/config:/config \
   -v /mnt/user/appdata/owlet/libs:/app/libs:ro \
   ghcr.io/btoth525/owlet-bridge-native:latest
@@ -67,8 +69,9 @@ docker compose up -d --build
 3. Click **Connect & Diagnose** — the camera UID / AuthKey / AV password
    auto-fill from the KMS.
 4. Click **Save & (re)start stream**.
-5. Video at **`http://<host>:1984`**, and **`rtsp://<host>:8554/owlet`** straight
-   into Frigate.
+5. Frigate (on the same Docker network) pulls
+   **`rtsp://owlet:<GO2RTC_PASS>@owlet-bridge:8554/owlet`**. go2rtc's own API/UI
+   (1984) stays on container loopback and is not published.
 
 ---
 

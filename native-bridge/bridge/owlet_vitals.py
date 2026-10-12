@@ -24,6 +24,8 @@ import re
 import time
 from typing import Any
 
+from owlet_api import redact_props
+
 # --- Smart Sock 3 REAL_TIME_VITALS short keys -------------------------------
 # Verified against ryanbdclark/pyowletapi const.py (VITALS_3). value ->
 # (friendly_key, unit).
@@ -257,6 +259,8 @@ class OwletVitals:
                 "model": model,
                 "kind": kind,
                 "sensors": extract_sensors(pmap),
-                "raw_props": {k: pmap[k] for k in sorted(pmap)},
+                # secret-looking property values masked: this map is logged by
+                # the discovery button and stored in snapshot.json
+                "raw_props": redact_props({k: pmap[k] for k in sorted(pmap)}),
             })
         return out

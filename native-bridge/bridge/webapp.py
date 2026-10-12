@@ -169,8 +169,9 @@ def save_config(cfg: dict, regenerate: bool = True) -> bool:
     if ok:
         return True
     log(f"!! CANNOT WRITE {cs.CONFIG_DIR}. The mounted config folder isn't writable "
-        "by this container — on Unraid run `chmod -R 777 "
-        "/mnt/user/appdata/owlet/config` and restart. Settings won't persist until then.")
+        "by this container (it runs as uid 1000) — on Unraid run `chown -R 1000:1000 /mnt/user/appdata/owlet && chmod -R u+rwX,go-rwx /mnt/user/appdata/owlet` "
+        "and restart. Never chmod 777: the folder holds your Owlet password and "
+        "camera keys. Settings won't persist until then.")
     return False
 
 

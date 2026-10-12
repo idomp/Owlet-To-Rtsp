@@ -89,11 +89,15 @@ Two volumes: **`/config`** (settings) and **`/app/libs`** (the TUTK libraries).
 
 ### 2 · Make `/config` writable
 
-The container runs as a non‑root (Termux) user, so the Unraid appdata folder must be writable by it:
+The container runs as a non‑root (Termux) user, uid **1000**. Give that user the folder and keep everyone else out — it holds your Owlet password, the camera keys and the RTSP/MQTT credentials:
 
 ```bash
-chmod -R 777 /mnt/user/appdata/owlet/config
+mkdir -p /mnt/user/appdata/owlet/config /mnt/user/appdata/owlet/libs
+chown -R 1000:1000 /mnt/user/appdata/owlet
+chmod -R u+rwX,go-rwx /mnt/user/appdata/owlet
 ```
+
+**Never `chmod 777` this folder**, and don't export it over SMB. The bridge itself creates every file `0600` and every folder `0700` (`umask 077`) and tightens older files at boot.
 
 ### 3 · Provide the TUTK libraries (in the browser)
 
@@ -317,7 +321,7 @@ Everything's set in the web UI; these env vars override or tune it:
 | Symptom | Fix |
 |---|---|
 | **KMS `403 Forbidden`** on diagnose | DSN is wrong — it starts with the **letter `O`** (`OCD…`), not a zero. |
-| **`PermissionError` / settings won't save** | `chmod -R 777 /mnt/user/appdata/owlet/config`, restart. |
+| **`PermissionError` / settings won't save** | `chown -R 1000:1000 /mnt/user/appdata/owlet && chmod -R u+rwX,go-rwx /mnt/user/appdata/owlet`, restart. Never 777. |
 | **Frigate can't reach the bridge** (`connection refused` / `no route` / `401`) | Both containers must be on the same user‑defined Docker network (`owlet-net`), and the URL must carry `GO2RTC_USER:GO2RTC_PASS@`. |
 | **Port conflict with Frigate** | None by default: the bridge publishes only `8088`. |
 | **"Open video UI" / copy buttons don't work** | Set the `PUBLIC_*` env vars and pull `:latest` (clipboard is blocked on plain http — the new UI falls back). |

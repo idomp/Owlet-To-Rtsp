@@ -1260,7 +1260,7 @@ def stream_once(uid: str, sec_mode: int) -> int:
     vol_thr = None
     player_thr = None
     try:
-        log(f"connecting UID={uid} authKey={'yes' if AUTHKEY else 'no'} …")
+        log(f"connecting UID={uid[:4]}…{uid[-2:]} authKey={'yes' if AUTHKEY else 'no'} …")
         ak = AUTHKEY.encode()
         if AUTHKEY and len(ak) != 8:
             log(f"WARNING: authKey is {len(ak)} chars; the SDK requires exactly 8 "

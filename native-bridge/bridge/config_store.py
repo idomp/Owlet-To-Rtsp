@@ -27,11 +27,13 @@ import re
 _CAND_RE = re.compile(r"^[\w.\[\]:-]+:\d{1,5}$")
 
 
-def _atomic_write(path: str, text: str, mode: int | None = None) -> None:
+def _atomic_write(path: str, text: str, mode: int | None = 0o600) -> None:
     """Write text to path atomically: tmp file + fsync + os.replace. A crash,
     SIGKILL, or full disk mid-write can never leave a half-written/empty file
-    (which previously could silently wipe the saved config). With `mode`, the
-    file is created with exactly that permission (no world-readable window)."""
+    (which previously could silently wipe the saved config). The file is
+    created with `mode` (default 0600: everything written here is a credential
+    or derived from one) with no world-readable window; mode=None keeps the
+    process umask."""
     tmp = path + ".tmp"
     if mode is None:
         fh = open(tmp, "w")
@@ -278,7 +280,7 @@ def save_config(cfg: dict, regenerate: bool = True) -> bool:
     if isinstance(mq, dict):
         out["mqtt"] = {k: mq.get(k, MQTT_DEFAULTS[k]) for k in MQTT_FIELDS}
     try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
         _atomic_write(CONFIG_PATH, json.dumps(out, indent=2))
     except OSError:
         return False
@@ -698,7 +700,11 @@ def generate(account: dict, cameras: list[dict]) -> str:
     """Write per-camera env files + the generated go2rtc config. With no cameras
     yet, still emit a single placeholder `owlet` stream so default URLs resolve."""
     render_cams = cameras or [dict(CAMERA_DEFAULTS, name=DEFAULT_CAM_NAME)]
-    os.makedirs(CAM_DIR, exist_ok=True)
+    os.makedirs(CAM_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(CAM_DIR, 0o700)
+    except OSError:
+        pass
     for cam in render_cams:
         _write_env(os.path.join(CAM_DIR, cam["name"] + ".env"), camera_env(account, cam))
     # legacy primary env, for the baked-in single-cam fallback go2rtc.yaml
