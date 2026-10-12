@@ -609,21 +609,17 @@ CAM_SENSOR_KEYS = ("temperature", "humidity", "noise", "brightness",
 def _cam_sensor_devices() -> list[dict]:
     """Live room sensors per camera, written by tutk_client from the TUTK
     stream (temp/noise/motion/sound from frame info; humidity/brightness from
-    the GetRealtimeData IOCTL)."""
-    import json as _json
+    the GetRealtimeData IOCTL). Fresh fields only — same staleness rule as
+    the MQTT publisher (OWLET_SENSOR_STALE), so the UI never shows an old
+    reading as live, and "ts" is the newest measurement time."""
+    from vitals_poller import _read_cam_sidecars
     out = []
-    cfg = cs.load_config()
-    for name in cs.camera_names(cfg):
-        try:
-            with open(cs.cam_sensors_path(name)) as f:
-                data = _json.load(f)
-        except (FileNotFoundError, ValueError):
-            continue
-        sensors = {k: data[k] for k in CAM_SENSOR_KEYS if k in data}
+    for d in _read_cam_sidecars():
+        sensors = {k: d["sensors"][k] for k in CAM_SENSOR_KEYS if k in d["sensors"]}
         if not sensors:
             continue
-        out.append({"dsn": name, "name": name, "model": "Owlet Cam",
-                    "kind": "cam", "sensors": sensors, "ts": data.get("ts")})
+        out.append({"dsn": d["dsn"], "name": d["name"], "model": "Owlet Cam",
+                    "kind": "cam", "sensors": sensors, "ts": d.get("ts")})
     return out
 
 

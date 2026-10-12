@@ -199,15 +199,30 @@ def _gate_realtime(temp, humidity):
     return t, h
 
 
-def _publish_cam_sensors(**fields) -> None:
-    """Merge new readings into the sidecar JSON (atomic write)."""
+def _publish_cam_sensors(_clear=(), **fields) -> None:
+    """Merge new readings into the sidecar JSON (atomic write).
+
+    Every field carries its own measurement time in "field_ts", so a reader can
+    tell a fresh temperature from a humidity value last seen an hour ago (the
+    old single "ts" made every stale field look as new as the latest one).
+    Fields named in `_clear` were reported as not-available by the camera and
+    are removed instead of keeping their last good value."""
     if not (CAM_SENSORS_PATH and SENSORS_ENABLED):
         return
     if fields.get("temperature") is not None and TEMP_SCALE != 1.0:
         fields["temperature"] = round(fields["temperature"] / TEMP_SCALE, 1)
+    now = time.time()
     with _CAM_SENSORS_LOCK:
-        _CAM_SENSORS.update({k: v for k, v in fields.items() if v is not None})
-        _CAM_SENSORS["ts"] = time.time()
+        fts = _CAM_SENSORS.setdefault("field_ts", {})
+        for k in _clear:
+            if fields.get(k) is None:
+                _CAM_SENSORS.pop(k, None)
+                fts.pop(k, None)
+        for k, v in fields.items():
+            if v is not None:
+                _CAM_SENSORS[k] = v
+                fts[k] = now
+        _CAM_SENSORS["ts"] = now
         try:
             tmp = CAM_SENSORS_PATH + ".tmp"
             with open(tmp, "w") as f:
@@ -280,6 +295,8 @@ def _realtime_thread(av, av_idx, stop_evt):
                         int.from_bytes(b[0:4], "little", signed=True),
                         int.from_bytes(b[4:8], "little", signed=True))
                     _publish_cam_sensors(
+                        # 0xFF sentinel -> the cam has no reading: clear it
+                        _clear=("temperature", "humidity"),
                         temperature=temp,
                         humidity=hum,
                         noise=int.from_bytes(b[8:12], "little", signed=True),

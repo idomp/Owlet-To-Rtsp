@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 
 import config_store as cs
@@ -74,12 +75,23 @@ HA_META = {
 
 
 class _Mqtt:
-    """Wraps a paho MQTT client; (re)connects when the UI/env settings change."""
+    """Wraps a paho MQTT client; (re)connects when the UI/env settings change.
+
+    Every successful (re)connect -- including paho's silent automatic
+    reconnects after a network blip -- republishes the retained bridge
+    "online" status, every discovery payload sent so far and each device's
+    availability, and forces the next state publish. Without that the broker's
+    retained last-will "offline" stuck after a reconnect and every Home
+    Assistant entity stayed unavailable until the container restarted."""
 
     def __init__(self, log):
         self.log = log
         self.c = None
         self._announced: set[str] = set()
+        self._discovery: dict[str, str] = {}   # config topic -> payload (for replay)
+        self._avail: dict[str, str] = {}       # availability topic -> last value
+        self._last_state: dict[str, str] = {}  # state topic -> last payload sent
+        self._lock = threading.Lock()
         self._key = None          # settings fingerprint we're connected with
         self.prefix = "homeassistant"
 
@@ -96,7 +108,11 @@ class _Mqtt:
         # settings changed -> tear the old connection down
         if key != self._key:
             self._disconnect()
-            self._announced.clear()
+            with self._lock:
+                self._announced.clear()
+                self._discovery.clear()
+                self._avail.clear()
+                self._last_state.clear()
             self._key = key
         if not s.get("enabled") or not s.get("host"):
             return
@@ -115,13 +131,31 @@ class _Mqtt:
             if s.get("user"):
                 c.username_pw_set(s["user"], s.get("password") or "")
             c.will_set(f"{STATE_PREFIX}/bridge/status", "offline", retain=True)
+            c.on_connect = self._on_connect
             c.connect(s["host"], int(s.get("port") or 1883), 60)
             c.loop_start()
-            c.publish(f"{STATE_PREFIX}/bridge/status", "online", retain=True)
             self.c = c
-            self.log(f"[vitals] MQTT connected to {s['host']}:{s.get('port')}")
+            self.log(f"[vitals] MQTT connecting to {s['host']}:{s.get('port')}")
         except Exception as e:  # noqa: BLE001
             self.log(f"[vitals] MQTT connect failed ({e}); will retry")
+
+    def _on_connect(self, client, _userdata, _flags, rc, *_a):
+        """paho callback for EVERY CONNACK (first connect and auto-reconnects)."""
+        try:
+            rc = int(rc)
+        except (TypeError, ValueError):
+            rc = getattr(rc, "value", rc)
+        if rc != 0:
+            self.log(f"[vitals] MQTT broker refused the connection (rc={rc})")
+            return
+        client.publish(f"{STATE_PREFIX}/bridge/status", "online", retain=True)
+        with self._lock:
+            replay = list(self._discovery.items()) + list(self._avail.items())
+            self._last_state.clear()     # next loop re-sends every state payload
+        for topic, payload in replay:
+            client.publish(topic, payload, retain=True)
+        self.log(f"[vitals] MQTT connected; republished online + {len(replay)} "
+                 "discovery/availability message(s)")
 
     def _disconnect(self):
         if self.c:
@@ -136,7 +170,17 @@ class _Mqtt:
     def _slug(s: str) -> str:
         return "".join(ch if ch.isalnum() else "_" for ch in str(s)).strip("_").lower()
 
+    def _pub(self, topic: str, payload: str, retain: bool = True) -> None:
+        self.c.publish(topic, payload, retain=retain)
+
     def publish_device(self, dev: dict):
+        """Discovery + availability + state for one device.
+
+        Only FRESH readings are published (the caller drops stale fields), a
+        key HA already knows but that is no longer fresh is sent as null (HA
+        shows "unknown", not the old value), the payload carries the
+        measurement time, and an unchanged payload is not re-sent. A device
+        with no fresh reading at all is marked unavailable."""
         if not self.c:
             return
         dsn = dev.get("dsn") or dev.get("name") or "owlet"
@@ -144,40 +188,66 @@ class _Mqtt:
         kind = dev.get("kind", "device")
         sensors = _to_us(dev.get("sensors") or {})
         state_topic = f"{STATE_PREFIX}/{node}/state"
+        avail_topic = f"{STATE_PREFIX}/{node}/availability"
+        fresh = {k: v for k, v in sensors.items() if k in HA_META and v is not None}
+        avail = "online" if fresh else "offline"
+        with self._lock:
+            changed = self._avail.get(avail_topic) != avail
+            self._avail[avail_topic] = avail
+        if changed:
+            self._pub(avail_topic, avail)
+        if not fresh:
+            return
         dev_info = {
             "identifiers": [f"owlet_{node}"],
             "name": f"Owlet {kind.title()} {dev.get('name', dsn)}",
             "manufacturer": "Owlet",
             "model": dev.get("model") or kind,
         }
-        for key, val in sensors.items():
-            meta = HA_META.get(key)
-            if not meta or val is None:
-                continue
-            friendly, unit, dclass, is_bin = meta
+        for key in fresh:
+            friendly, unit, dclass, is_bin = HA_META[key]
             comp = "binary_sensor" if is_bin else "sensor"
             uid = f"owlet_{node}_{key}"
-            if uid not in self._announced:
-                cfg = {
-                    "name": friendly,
-                    "state_topic": state_topic,
-                    "value_template": "{{ value_json.%s }}" % key,
-                    "unique_id": uid,
-                    "object_id": uid,
-                    "device": dev_info,
-                    "availability_topic": f"{STATE_PREFIX}/bridge/status",
-                }
-                if unit:
-                    cfg["unit_of_measurement"] = unit
-                if dclass:
-                    cfg["device_class"] = dclass
-                if is_bin:
-                    cfg["payload_on"] = 1
-                    cfg["payload_off"] = 0
-                self.c.publish(f"{self.prefix}/{comp}/{uid}/config",
-                               json.dumps(cfg), retain=True)
+            if uid in self._announced:
+                continue
+            cfg = {
+                "name": friendly,
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.%s }}" % key,
+                "unique_id": uid,
+                "object_id": uid,
+                "device": dev_info,
+                # unavailable if the bridge is gone OR this device's readings are stale
+                "availability": [{"topic": f"{STATE_PREFIX}/bridge/status"},
+                                 {"topic": avail_topic}],
+                "availability_mode": "all",
+            }
+            if unit:
+                cfg["unit_of_measurement"] = unit
+            if dclass:
+                cfg["device_class"] = dclass
+            if is_bin:
+                cfg["payload_on"] = 1
+                cfg["payload_off"] = 0
+            topic = f"{self.prefix}/{comp}/{uid}/config"
+            payload = json.dumps(cfg)
+            with self._lock:
+                self._discovery[topic] = payload
                 self._announced.add(uid)
-        self.c.publish(state_topic, json.dumps(sensors), retain=True)
+            self._pub(topic, payload)
+        # keys announced for this node earlier but not fresh now -> explicit null
+        state = {k: None for k in HA_META
+                 if f"owlet_{node}_{k}" in self._announced and k not in fresh}
+        state.update(fresh)
+        ts = dev.get("ts")
+        if isinstance(ts, (int, float)):
+            state["measured_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+        payload = json.dumps(state, sort_keys=True)
+        with self._lock:
+            if self._last_state.get(state_topic) == payload:
+                return               # same reading, same measurement -> not "new"
+            self._last_state[state_topic] = payload
+        self._pub(state_topic, payload)
 
 
 def _write_overlays(devices: list[dict], log):
@@ -214,7 +284,19 @@ def _write_overlays(devices: list[dict], log):
             pass
 
 
-def _read_cam_sidecars() -> list[dict]:
+# A camera reading older than this is not published as current (the stream
+# died, or the camera stopped reporting that field).
+STALE_AFTER = int(os.environ.get("OWLET_SENSOR_STALE") or "60")
+
+
+def _read_cam_sidecars(now: float | None = None) -> list[dict]:
+    """Camera room sensors from tutk_client's sidecars, FRESH fields only.
+
+    Uses each field's own measurement time ("field_ts"; older sidecars without
+    it fall back to the file-level "ts"). A camera whose sidecar has no fresh
+    field is still returned, with empty sensors, so MQTT can mark it
+    unavailable and the HUD is blanked instead of showing old numbers."""
+    now = time.time() if now is None else now
     out = []
     for name in cs.camera_names():
         try:
@@ -222,10 +304,22 @@ def _read_cam_sidecars() -> list[dict]:
                 data = json.load(f)
         except (FileNotFoundError, ValueError):
             continue
-        sensors = {k: v for k, v in data.items() if k != "ts"}
-        if sensors:
-            out.append({"dsn": name, "name": name, "model": "Owlet Cam",
-                        "kind": "cam", "sensors": sensors, "ts": data.get("ts")})
+        if not isinstance(data, dict):
+            continue
+        fts = data.get("field_ts") if isinstance(data.get("field_ts"), dict) else {}
+        file_ts = data.get("ts")
+        sensors, newest = {}, None
+        for k, v in data.items():
+            if k in ("ts", "field_ts") or v is None:
+                continue
+            t = fts.get(k, file_ts)
+            if not isinstance(t, (int, float)) or now - t > STALE_AFTER:
+                continue
+            sensors[k] = v
+            newest = t if newest is None else max(newest, t)
+        out.append({"dsn": name, "name": name, "model": "Owlet Cam",
+                    "kind": "cam", "sensors": sensors, "ts": newest,
+                    "stale": not sensors})
     return out
 
 
