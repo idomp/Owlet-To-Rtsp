@@ -32,8 +32,21 @@ from flask import Flask, Response, jsonify, render_template, request
 import config_store as cs
 
 app = Flask(__name__)
-# Owlet APK bundles (.apkm) are large; allow up to 1 GB uploads.
-app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
+
+
+def _mb_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name) or default)) * 1024 * 1024
+    except ValueError:
+        return default * 1024 * 1024
+
+
+# Owlet APK bundles (.apkm/.xapk) are large, but not unbounded: the APK upload
+# is capped at OWLET_UPLOAD_MAX_MB (default 512 MB) and is the largest body any
+# endpoint accepts. Sounds / talk clips have their own, much smaller cap.
+UPLOAD_MAX = _mb_env("OWLET_UPLOAD_MAX_MB", 512)
+SOUND_MAX = _mb_env("OWLET_SOUND_MAX_MB", 50)
+app.config["MAX_CONTENT_LENGTH"] = UPLOAD_MAX + 1024 * 1024
 
 # Quiet the per-request access log so go2rtc / TUTK output is visible in
 # `docker logs` (the status/findings polling was drowning everything out).
@@ -787,28 +800,107 @@ def extract_libs_ep():
     return jsonify({"ok": ok, "message": msg})
 
 
+# Uploaded APKs land ONLY here, under a generated name — never in the /config
+# root, where a chosen filename could overwrite owlet.yaml or go2rtc.gen.yaml.
+UPLOAD_DIR = os.path.join(cs.CONFIG_DIR, "uploads")
+# .apkm is kept because the README's documented source (APKMirror) ships it.
+APK_EXTS = (".apk", ".apkm", ".xapk", ".apks")
+ZIP_MAGIC = b"PK\x03\x04"
+
+
+def _apk_ext(filename: str) -> str | None:
+    """The upload's lower-case extension if it is an allowed APK container and
+    the client-supplied name carries no path component; else None."""
+    if not filename or any(c in filename for c in ("/", "\\", "\0")) or ".." in filename:
+        return None
+    ext = os.path.splitext(filename.strip().lower())[1]
+    return ext if ext in APK_EXTS else None
+
+
+def _save_capped(stream, dest: str, limit: int) -> int:
+    """Copy `stream` into a new 0600 file at `dest`, refusing more than `limit`
+    bytes (raises ValueError and removes the partial file)."""
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError("too large")
+                out.write(chunk)
+    except BaseException:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise
+    return total
+
+
 @app.post("/api/upload_apk")
 def upload_apk():
-    """Accept an uploaded Owlet .apk/.apkm/.xapk and extract the TUTK libs from it."""
-    from werkzeug.utils import secure_filename
+    """Accept an uploaded Owlet .apk/.apkm/.xapk/.apks and extract the TUTK libs.
+
+    Checked by extension AND content (zip magic + a readable zip directory),
+    capped at OWLET_UPLOAD_MAX_MB, saved under a generated name in
+    /config/uploads only."""
+    import secrets as _secrets
+    import zipfile
     from lib_extract import provision
+    if request.content_length is not None and request.content_length > UPLOAD_MAX + 1024 * 1024:
+        return jsonify({"ok": False, "message": "upload too large"}), 413
     f = request.files.get("apk")
     if not f or not f.filename:
         return jsonify({"ok": False, "message": "no file received"}), 400
-    name = secure_filename(f.filename) or "owlet-upload.apkm"
-    dest_dir = cs.CONFIG_DIR
+    ext = _apk_ext(f.filename)
+    if not ext:
+        return jsonify({"ok": False,
+                        "message": "only .apk / .apkm / .xapk / .apks files are accepted"}), 400
+    head = f.stream.read(4)
+    if head != ZIP_MAGIC:
+        return jsonify({"ok": False, "message": "not an APK (no zip header)"}), 400
     try:
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, name)
-        f.save(dest)
+        os.makedirs(UPLOAD_DIR, mode=0o700, exist_ok=True)
+        dest = os.path.join(UPLOAD_DIR, f"owlet-{int(time.time())}-{_secrets.token_hex(4)}{ext}")
+        size = _save_capped(_Prefixed(head, f.stream), dest, UPLOAD_MAX)
+    except ValueError:
+        return jsonify({"ok": False, "message": "upload too large"}), 413
     except OSError as e:  # noqa: BLE001
         log(f"[upload] cannot save: {e}")
         return jsonify({"ok": False,
                         "message": f"cannot save upload ({e.strerror}) — is /config writable?"}), 500
-    log(f"[upload] received {name} ({os.path.getsize(dest)//1024} KB); extracting libraries…")
-    ok, msg = provision(TUTK_LIB_DIR, [dest_dir, "/config", "/app/libs"], log=log)
+    if not zipfile.is_zipfile(dest):
+        os.remove(dest)
+        return jsonify({"ok": False, "message": "not an APK (corrupt zip)"}), 400
+    # keep only the newest upload so repeated uploads can't fill appdata
+    for old in os.listdir(UPLOAD_DIR):
+        p = os.path.join(UPLOAD_DIR, old)
+        if p != dest:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    log(f"[upload] received {os.path.basename(dest)} ({size // 1024} KB); extracting libraries…")
+    ok, msg = provision(TUTK_LIB_DIR, [UPLOAD_DIR], log=log)
     log(f"[libs] {msg}")
     return jsonify({"ok": ok, "message": msg})
+
+
+class _Prefixed:
+    """A read()-able stream that yields `head` first, then `rest`."""
+
+    def __init__(self, head: bytes, rest):
+        self.head, self.rest = head, rest
+
+    def read(self, n: int = -1) -> bytes:
+        if self.head:
+            out, self.head = self.head, b""
+            return out
+        return self.rest.read(n)
 
 
 def _gen_hash():
@@ -937,6 +1029,8 @@ def list_sounds():
 @app.post("/api/sounds")
 def upload_sound():
     from werkzeug.utils import secure_filename
+    if (request.content_length or 0) > SOUND_MAX:
+        return jsonify({"ok": False, "error": "file too large"}), 413
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify({"ok": False, "error": "no file received"}), 400
@@ -1011,6 +1105,8 @@ def talk(camera):
     """Play a recorded mic clip out the camera speaker (hold-to-talk)."""
     if not _known_camera(camera):
         return jsonify({"ok": False, "error": "no such camera"}), 404
+    if (request.content_length or 0) > SOUND_MAX:
+        return jsonify({"ok": False, "error": "clip too large"}), 413
     f = request.files.get("audio")
     if not f:
         return jsonify({"ok": False, "error": "no audio received"}), 400

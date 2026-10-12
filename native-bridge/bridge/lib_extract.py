@@ -37,7 +37,7 @@ def find_archives(dirs) -> list[str]:
     for d in dirs:
         if not d or not os.path.isdir(d):
             continue
-        for ext in ("*.apk", "*.apkm", "*.xapk", "*.zip"):
+        for ext in ("*.apk", "*.apkm", "*.xapk", "*.apks", "*.zip"):
             out += glob.glob(os.path.join(d, "**", ext), recursive=True)
     # de-dupe, stable order, prefer bundles that likely hold an x86_64 split last-named
     return sorted(set(out))
