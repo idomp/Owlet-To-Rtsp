@@ -456,12 +456,36 @@ def _exec_source(name: str) -> str:
         'OWLET_CAM_SENSORS="/config/vitals/cam-%(n)s.json"; '
         # $A (audio FIFO) is intentionally NOT cleaned up here -- see above.
         'trap "rm -f $T $V $C $R" EXIT; '
+        # Process supervision. go2rtc stops an exec source by signalling ONLY
+        # this bash (no process group), so a foreground pipeline here used to
+        # leave tutk_client + ffmpeg orphaned, still holding the camera's
+        # single P2P slot. The pipeline therefore runs in the background with
+        # its two PIDs recorded (F = ffmpeg, P = tutk_client, the job leader),
+        # and TERM/INT/HUP forward SIGTERM to both (tutk_client releases the
+        # session cleanly), wait up to 8 s, SIGKILL whatever is left, exit.
+        # go2rtc sends SIGTERM (killsignal=15) and only SIGKILLs this shell
+        # after killtimeout=12 s, so the handler always finishes first.
+        # Explicit PIDs, not `kill %1`: bash spins forever in `kill -KILL %1`
+        # once one member of the job has already exited (seen in testing).
         'python3 /app/tutk_client.py 2>>%(l)s | '
         'ffmpeg -hide_banner -loglevel warning -fflags +genpts '
         '-use_wallclock_as_timestamps 1 -analyzeduration 5000000 -probesize 5000000 -f h264 -i - '
-        '-c:v copy -f rtsp -rtsp_transport tcp {output}'
+        '-c:v copy -f rtsp -rtsp_transport tcp {output} & '
+        'F=$!; P=$(jobs -p); '
+        '_stop() { trap - TERM INT HUP; kill -TERM $P $F 2>/dev/null; '
+        'for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; '
+        'do { kill -0 $P || kill -0 $F; } 2>/dev/null || break; sleep 0.5; done; '
+        'kill -KILL $P $F 2>/dev/null; exit 143; }; '
+        'trap _stop TERM INT HUP; wait'
     ) % {"e": envf, "l": logf, "n": slugify(name)}
-    return "exec:bash -c '" + cmd + "'"
+    # go2rtc parses "#key=value" options after the command (internal/exec);
+    # no space before '#', or YAML would read it as a comment.
+    return "exec:bash -c '" + cmd + "'" + EXEC_KILL_OPTS
+
+
+# SIGTERM (15) to the wrapper, SIGKILL only after 12 s (go2rtc 1.9.x
+# internal/exec/closer.go: killsignal / killtimeout).
+EXEC_KILL_OPTS = "#killsignal=15#killtimeout=12"
 
 
 def audio_filter() -> str:

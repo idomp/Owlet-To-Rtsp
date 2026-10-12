@@ -308,7 +308,7 @@ Everything's set in the web UI; these env vars override or tune it:
 | `OWLET_KEEPALIVE` | `1` | keep one camera session warm 24/7 (auto‑reconnect). **Leave on.** |
 | `OWLET_SESSION_CHECK` | `0` | experimental: log the TUTK session mode (P2P/relay) after each connect — crashed the stream process on the reference camera's lib build, keep off unless debugging |
 | `OWLET_STALL_TIMEOUT` | `30` | seconds without a video frame before the stream process unblocks/relaunches itself (see [Self‑healing](native-bridge/docs/self-heal.md)) |
-| `OWLET_WATCHDOG` | `1` | container watchdog: restart a dead camera's stream process, then (rate‑limited) the container |
+| `OWLET_WATCHDOG` | `0` | container watchdog: restart a dead camera's stream process, then (rate‑limited) the container. **Off by default until validated on your hardware**; `1` enables it |
 | `OWLET_WATCHDOG_STALL` / `_PRODUCER_RESTARTS` / `_COOLDOWN` | `120` / `2` / `300` | seconds between watchdog actions · stream restarts before a container restart · minimum seconds between container restarts (doubles each time, resets after 15 min healthy) |
 | `OWLET_AV_SECURITY_MODE` | *(auto)* | pin `0` Simple / `1` Dtls / `2` Auto |
 | `OWLET_REGION_CODE` | `3` | TUTK region (US = 3) |

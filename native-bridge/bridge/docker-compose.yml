@@ -27,6 +27,7 @@ services:
     image: ghcr.io/btoth525/owlet-bridge-native:latest
     container_name: owlet-bridge
     restart: unless-stopped
+    init: true                        # reap anything a stream process leaves behind
     security_opt:
       - no-new-privileges:true
     environment:
@@ -36,6 +37,7 @@ services:
       OWLET_UI_PASS: "${OWLET_UI_PASS:?set OWLET_UI_PASS (control panel password)}"
       OWLET_TALK: "0"                 # talk-back / streamed sound playback endpoints disabled
       OWLET_VITALS_POLL: "0"          # sock cloud poller WRITES APP_ACTIVE to the sock — leave off
+      OWLET_WATCHDOG: "0"             # self-heal ladder off until validated (default)
       OWLET_REFRESH_KMS: "0"          # no automatic Owlet cloud logins; use the saved key
       OWLET_FORGET_ACCOUNT: "1"       # blank the stored email/password once every camera has a key
       GO2RTC_USER: "${GO2RTC_USER:-owlet}"

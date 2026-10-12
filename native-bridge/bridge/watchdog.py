@@ -39,7 +39,8 @@ single P2P slot was still held by the dying session, so the relaunched process
 often got a dud session and the cycle repeated ("amplifying wedges", TOT-33).
 A producer-only restart fixes the same fault in seconds without any of that.
 
-  OWLET_WATCHDOG=0                       disable entirely
+  OWLET_WATCHDOG=1                       enable (DEFAULT OFF until the ladder is
+                                         validated on real hardware)
   OWLET_WATCHDOG_STALL=120               seconds of no frames between actions
   OWLET_WATCHDOG_INTERVAL=15             seconds between probes
   OWLET_WATCHDOG_GRACE=60                startup grace before the first probe
@@ -280,6 +281,35 @@ def restart_producer(name: str) -> bool:
     return True
 
 
+def stop_all_producers(names=None, timeout: float = 10.0) -> list[int]:
+    """Stop every camera's stream process tree (wrapper bash, tutk_client,
+    ffmpeg) BEFORE go2rtc is restarted. go2rtc's /api/restart re-execs itself
+    in place without stopping its exec sources, so their children used to be
+    left running, still holding each camera's single P2P slot. SIGTERM the
+    wrappers (their trap forwards it to tutk_client + ffmpeg), then SIGKILL
+    anything still alive after `timeout`. Returns the PIDs that were targeted."""
+    try:
+        names = list(names) if names is not None else cs.camera_names()
+    except Exception:  # noqa: BLE001
+        names = []
+    procs = _procs()
+    wrappers, kids = set(), set()
+    for n in names:
+        py, others, wr = producer_pids(n, procs)
+        kids.update(py)
+        kids.update(others)
+        wrappers.update(wr)
+    allp = sorted(wrappers | kids)
+    if not allp:
+        return []
+    _kill(sorted(wrappers), signal.SIGTERM)
+    _kill(sorted(kids), signal.SIGTERM)
+    if not _gone(allp, timeout):
+        _kill(allp, signal.SIGKILL)
+        _gone(allp, 2)
+    return allp
+
+
 # --------------------------------------------------------------------------- #
 # stage 2: restart the whole container
 # --------------------------------------------------------------------------- #
@@ -468,7 +498,9 @@ class Watchdog:
 
 
 def main() -> None:
-    if os.environ.get("OWLET_WATCHDOG", "1") == "0":
+    # Off by default: the restart ladder has not been validated end-to-end
+    # (see the reviews' notes on the ffprobe probe); opt in with OWLET_WATCHDOG=1.
+    if os.environ.get("OWLET_WATCHDOG", "0") != "1":
         return
     time.sleep(GRACE)
     wd = Watchdog()

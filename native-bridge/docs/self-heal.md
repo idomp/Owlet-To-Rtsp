@@ -100,7 +100,7 @@ All env vars are optional; defaults are what the field data suggested.
 | `OWLET_SPARE_STREAMS` | `8` | identical never-started go2rtc spare streams per camera, one consumed per wedge recovery between container restarts |
 | `OWLET_STALL_TIMEOUT` | `30` | seconds without a forwarded video frame before layer 1 acts (kept ≥ `OWLET_NO_VIDEO_TIMEOUT` + 10) |
 | `OWLET_STALL_UNBLOCK_WAIT` | `8` | seconds to give `avClientStop()` before the hard exit |
-| `OWLET_WATCHDOG` | `1` | `0` disables the container watchdog entirely |
+| `OWLET_WATCHDOG` | `0` | off by default until validated; `1` enables the container watchdog |
 | `OWLET_WATCHDOG_STALL` | `120` | seconds of no frames between watchdog actions |
 | `OWLET_WATCHDOG_INTERVAL` | `15` | seconds between probes |
 | `OWLET_WATCHDOG_GRACE` | `60` | startup grace before the first probe |

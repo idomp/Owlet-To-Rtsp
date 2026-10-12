@@ -991,16 +991,31 @@ def _gen_hash():
 _LAST_GEN = {"h": _gen_hash()}
 
 
-def restart_go2rtc(force: bool = False):
-    h = _gen_hash()
-    if not force and h is not None and h == _LAST_GEN["h"]:
-        return  # generated config unchanged — leave the live sessions alone
-    _LAST_GEN["h"] = h
+def _stop_and_restart():
+    """go2rtc's /api/restart re-execs it in place WITHOUT stopping its exec
+    sources, which orphaned every tutk_client/ffmpeg (still holding the
+    camera's P2P slot). Stop the stream process trees first, then restart."""
+    try:
+        import watchdog as _wd
+        stopped = _wd.stop_all_producers()
+        if stopped:
+            log(f"stopped {len(stopped)} stream process(es) before the go2rtc restart.")
+    except Exception as e:  # noqa: BLE001
+        log(f"stopping stream processes failed: {e}")
     try:
         requests.post(f"{GO2RTC_API}/api/restart", timeout=4)
         log("requested go2rtc restart.")
     except Exception as e:  # noqa: BLE001
         log(f"restart error: {e}")
+
+
+def restart_go2rtc(force: bool = False):
+    h = _gen_hash()
+    if not force and h is not None and h == _LAST_GEN["h"]:
+        return  # generated config unchanged — leave the live sessions alone
+    _LAST_GEN["h"] = h
+    # off the request thread: stopping the producers can take up to ~10 s
+    threading.Thread(target=_stop_and_restart, daemon=True).start()
 
 
 @app.post("/api/stream/restart")

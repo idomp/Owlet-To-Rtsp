@@ -20,7 +20,7 @@ LIBRARIES: the proprietary TUTK .so libs are not shipped. In the web UI's "TUTK 
   <WebUI>https://[IP]:[PORT:8088]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/btoth525/Owlet-To-Rtsp/main/unraid/owlet-bridge-native.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/btoth525/Owlet-To-Rtsp/main/unraid/icon.png</Icon>
-  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <ExtraParams>--init --restart unless-stopped --security-opt no-new-privileges</ExtraParams>
   <PostArgs/>
   <DonateText/>
   <DonateLink/>

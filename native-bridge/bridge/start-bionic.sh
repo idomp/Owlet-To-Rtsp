@@ -105,8 +105,9 @@ fi
 # go2rtc relaunches the one stream with a fresh key (go2rtc, the UI and the other
 # cameras stay up); only if that fails twice, kill go2rtc so Docker restarts the
 # container — rate-limited with a doubling cooldown so a camera that is truly
-# offline can't churn Owlet cloud logins. Set OWLET_WATCHDOG=0 to disable.
-if [ "${OWLET_WATCHDOG:-1}" = "1" ]; then
+# offline can't churn Owlet cloud logins. OFF by default until validated on real
+# hardware; set OWLET_WATCHDOG=1 to enable.
+if [ "${OWLET_WATCHDOG:-0}" = "1" ]; then   # default OFF until validated
   python3 /app/watchdog.py &
 fi
 
