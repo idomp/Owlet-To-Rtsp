@@ -17,3 +17,7 @@ frida-server-*
 # Python caches
 __pycache__/
 *.pyc
+
+# Owlet app bundle (proprietary, never commit)
+bundle/
+.venv-cam/
