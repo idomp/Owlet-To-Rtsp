@@ -1,14 +1,14 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>owlet-bridge-native</Name>
-  <Repository>ghcr.io/btoth525/owlet-bridge-native:latest</Repository>
-  <Registry>https://github.com/btoth525/Owlet-To-Rtsp/pkgs/container/owlet-bridge-native</Registry>
+  <Repository>ghcr.io/idomp/owlet-bridge-native:latest</Repository>
+  <Registry>https://github.com/idomp/Owlet-To-Rtsp/pkgs/container/owlet-bridge-native</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/btoth525/Owlet-To-Rtsp</Support>
-  <Project>https://github.com/btoth525/Owlet-To-Rtsp/tree/main/native-bridge/bridge</Project>
+  <Support>https://github.com/idomp/Owlet-To-Rtsp</Support>
+  <Project>https://github.com/idomp/Owlet-To-Rtsp/tree/main/native-bridge/bridge</Project>
   <Overview>Native Owlet Cam -&gt; RTSP bridge. Enter your Owlet account in the web control panel (https://[IP]:8088); it fetches the camera key, connects to the camera over ThroughTek/Kalay (TUTK) and serves the video as RTSP via go2rtc.
 
 SECURE BY DEFAULT: only the control panel (8088) is published. go2rtc's HTTP API stays on container loopback (it can rewrite its config and run commands, so it is never published) and RTSP/WebRTC are NOT published.
@@ -18,8 +18,8 @@ FRIGATE: put this container and Frigate on the same user-defined Docker network 
 LIBRARIES: the proprietary TUTK .so libs are not shipped. In the web UI's "TUTK libraries" card, click "Upload &amp; extract" and pick your Owlet .apkm/.apk.</Overview>
   <Category>Tools: MediaApp:Video HomeAutomation:</Category>
   <WebUI>https://[IP]:[PORT:8088]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/btoth525/Owlet-To-Rtsp/main/unraid/owlet-bridge-native.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/btoth525/Owlet-To-Rtsp/main/unraid/icon.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/idomp/Owlet-To-Rtsp/main/unraid/owlet-bridge-native.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/idomp/Owlet-To-Rtsp/main/unraid/icon.png</Icon>
   <ExtraParams>--init --restart unless-stopped --security-opt no-new-privileges</ExtraParams>
   <PostArgs/>
   <DonateText/>
@@ -32,6 +32,6 @@ LIBRARIES: the proprietary TUTK .so libs are not shipped. In the web UI's "TUTK 
   <Config Name="go2rtc user (RTSP)" Target="GO2RTC_USER" Default="owlet" Mode="" Description="Username go2rtc requires for RTSP (and its API, if you ever widen GO2RTC_API_LISTEN). Loopback clients inside the container are exempt." Type="Variable" Display="always" Required="true" Mask="false">owlet</Config>
   <Config Name="go2rtc password (RTSP)" Target="GO2RTC_PASS" Default="" Mode="" Description="Password for the RTSP URL Frigate uses: rtsp://owlet:PASSWORD@owlet-bridge-native:8554/owlet. Leave blank to have one generated into /config/secrets/go2rtc.json (mode 0600)." Type="Variable" Display="always" Required="false" Mask="true"/>
   <Config Name="WebRTC candidate (app)" Target="OWLET_WEBRTC_CANDIDATE" Default="" Mode="" Description="Only relevant if you deliberately publish WebRTC (8555) and the go2rtc API, which this template no longer does. For sub-second WebRTC to a phone/app, set this to &lt;Unraid-LAN-IP&gt;:&lt;WebRTC host port&gt;, e.g. 192.168.1.204:18555. This is the address go2rtc advertises to clients for the media connection — without it the app gets an SDP answer but no video. Leave blank if you only watch via Frigate or the LAN go2rtc UI." Type="Variable" Display="always" Required="false" Mask="false"/>
-  <Config Name="Config (settings)" Target="/config" Default="/mnt/user/appdata/owlet/config" Mode="rw" Description="Persists your UI settings + camera key. Drop your Owlet .apkm here too (or upload it in the UI)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/owlet/config</Config>
-  <Config Name="TUTK libs (/app/libs)" Target="/app/libs" Default="/mnt/user/appdata/owlet/libs" Mode="rw" Description="Folder the extracted x86_64 TUTK .so libraries live in (under x86_64/). The UI's Upload &amp; extract writes them here." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/owlet/libs</Config>
+  <Config Name="Config (settings)" Target="/config" Default="/mnt/user/appdata/owlet-camera/config" Mode="rw" Description="Persists your UI settings + camera key. Drop your Owlet .apkm here too (or upload it in the UI)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/owlet-camera/config</Config>
+  <Config Name="TUTK libs (/app/libs)" Target="/app/libs" Default="/mnt/user/appdata/owlet-camera/libs" Mode="rw" Description="Folder the extracted x86_64 TUTK .so libraries live in (under x86_64/). The UI's Upload &amp; extract writes them here." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/owlet-camera/libs</Config>
 </Container>
