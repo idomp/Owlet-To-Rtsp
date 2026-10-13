@@ -185,7 +185,8 @@ class DeploymentFilesTests(unittest.TestCase):
 
     def test_compose_config_dir_matches_the_unraid_template(self):
         with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
-            compose = fh.read()
+            # live lines only: the header's migration note names the old path
+            compose = "".join(ln for ln in fh if not ln.lstrip().startswith("#"))
         with open(os.path.join(HERE, "..", "..", "..", "unraid",
                                "owlet-bridge-native.xml"), encoding="utf-8") as fh:
             template = fh.read()

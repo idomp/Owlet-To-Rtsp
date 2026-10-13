@@ -60,6 +60,12 @@ docker run -d --name owlet-bridge --restart unless-stopped --init --network owle
 cd native-bridge/bridge
 docker compose up -d --build
 ```
+Upgrading an existing compose install: the default config location moved from
+`/mnt/user/appdata/owlet` to `/mnt/user/appdata/owlet-camera`. If you never set
+`APPDATA`, either set `APPDATA=/mnt/user/appdata/owlet` to keep the old location,
+or stop the service and move `/mnt/user/appdata/owlet/config` into
+`/mnt/user/appdata/owlet-camera/` once. Otherwise the bridge starts from an
+empty `/config` with new credentials (see the compose file's header).
 
 ---
 

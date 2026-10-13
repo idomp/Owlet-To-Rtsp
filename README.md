@@ -169,6 +169,8 @@ docker run -d --name owlet-bridge --restart unless-stopped --network owlet-net \
 
 **docker compose:** see [`native-bridge/bridge/docker-compose.yml`](native-bridge/bridge/docker-compose.yml).
 
+> **Upgrading an existing compose install:** the file's default config location changed from `/mnt/user/appdata/owlet` to `/mnt/user/appdata/owlet-camera` (the Unraid template's path). If you never set `APPDATA`, recreating the service would mount an empty `/config` and the bridge would start fresh with new credentials. Either set `APPDATA=/mnt/user/appdata/owlet` (shell or `.env`) to keep the old location, or stop the service once and move the folder: `mkdir -p /mnt/user/appdata/owlet-camera && mv /mnt/user/appdata/owlet/config /mnt/user/appdata/owlet-camera/`.
+
 By default the control panel's RTSP copy URL uses the container's hostname and the port go2rtc listens on (`GO2RTC_RTSP_LISTEN`), i.e. what another container on the same Docker network connects to. If you published RTSP on the host yourself, set `PUBLIC_RTSP_PORT` to the host port and the URL uses the host name you opened the panel with; `OWLET_ADVERTISE_RTSP=host:port` overrides both (see the variable table below). The WebRTC/HLS links only appear if you widen `GO2RTC_API_LISTEN`; `PUBLIC_HTTP_PORT` / `PUBLIC_WEBRTC_PORT` then tell the UI which host ports you published.
 
 ---

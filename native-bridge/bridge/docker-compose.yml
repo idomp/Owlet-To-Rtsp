@@ -21,6 +21,16 @@
 # (e.g. "<host-ip>:18554:8554"), firewall it to the Frigate host only, and set
 # PUBLIC_RTSP_PORT=18554 so the control panel's RTSP link shows that port
 # (or OWLET_ADVERTISE_RTSP=<host>:18554 to pin the whole address).
+#
+# Upgrading from an older copy of this file: the default config location moved
+# from /mnt/user/appdata/owlet to /mnt/user/appdata/owlet-camera. If you never
+# set APPDATA, recreating the service would start from an empty /config (new
+# credentials, no cameras). Either keep the old location with
+# APPDATA=/mnt/user/appdata/owlet in .env, or move the folder once with the
+# service stopped:
+#   docker compose down
+#   mkdir -p /mnt/user/appdata/owlet-camera
+#   mv /mnt/user/appdata/owlet/config /mnt/user/appdata/owlet-camera/
 
 name: owlet-bridge
 
