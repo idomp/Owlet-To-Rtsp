@@ -23,10 +23,20 @@ This keeps the state in one file shared by every stream process (flock'd):
 
 With the defaults a failure episode costs at most 5 logins, spread over
 60+120+240+480 s (~15 min), then none.
+
+"Video from a key that an automatic refresh just fetched" is tracked in the
+same file as a *pending* key per camera: when a refresh returns a key that
+differs from the one held, its fingerprint (a SHA-256 over uid, authkey and
+AV password; never the key itself) is stored under `pending_keys`. It stays
+pending across failed sessions and process restarts until a session with
+that exact key delivers video (record_video(): attempts -> 0, pending
+cleared) or the next changed-key fetch for that camera supersedes it. Video
+from any other key (the saved key, another camera's) leaves the guard alone.
 """
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import time
@@ -121,6 +131,52 @@ def record_success() -> None:
                 _save(st)
     except OSError:
         pass
+
+
+def key_fingerprint(uid, authkey, av_password) -> str:
+    """Hex SHA-256 identifying a camera key without storing any of it."""
+    def b(v):
+        if v is None:
+            return b""
+        return v if isinstance(v, bytes) else str(v).encode()
+    return hashlib.sha256(b"\0".join((b(uid), b(authkey), b(av_password)))).hexdigest()
+
+
+def _pending(st: dict) -> dict:
+    p = st.get("pending_keys")
+    return {str(k): v for k, v in p.items() if isinstance(v, str)} if isinstance(p, dict) else {}
+
+
+def set_pending(camera: str, fingerprint: str) -> None:
+    """An automatic refresh fetched a NEW key for `camera`: remember its
+    fingerprint until it delivers video. Replaces (supersedes) that camera's
+    previous pending key. Raises OSError if the state can't be stored."""
+    with _locked():
+        st = _load()
+        pend = _pending(st)
+        pend[camera or ""] = fingerprint
+        st["pending_keys"] = pend
+        _save(st)
+
+
+def record_video(fingerprint: str) -> bool:
+    """A session forwarded its first frame with the key `fingerprint`. If that
+    is a pending refreshed key, the login that fetched it worked: reset the
+    escalation like record_success() (next_allowed untouched) and clear the
+    pending entry. Any other key changes nothing. Returns True on a reset.
+    Raises OSError if the state can't be read-locked or stored."""
+    with _locked():
+        st = _load()
+        pend = _pending(st)
+        hits = [cam for cam, fp in pend.items() if fp == fingerprint]
+        if not hits:
+            return False
+        for cam in hits:
+            del pend[cam]
+        st["pending_keys"] = pend
+        st.update(attempts=0, last_ok=time.time())
+        _save(st)
+        return True
 
 
 def status() -> dict:

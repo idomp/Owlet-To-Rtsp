@@ -133,8 +133,6 @@ class ResolveCredsTests(TmpConfig):
                   mock.patch.object(tc, "_SESSION_VIDEO", [False]),
                   mock.patch.object(tc, "_HAD_VIDEO", [False]),
                   mock.patch.object(tc, "_GUARD_ERR_LOGGED", [False]),
-                  mock.patch.object(tc, "_KEY_REFRESHED", [False]),
-                  mock.patch.object(tc, "_SESSION_FRESH_KEY", [False]),
                   mock.patch.object(tc, "log", lambda *a: None)):
             p.start()
             self.addCleanup(p.stop)
@@ -165,21 +163,88 @@ class ResolveCredsTests(TmpConfig):
             tc.resolve_creds()
         self.assertEqual(FakeAPI.calls, 2)  # no per-process lifetime cap
 
+    @staticmethod
+    def pending():
+        return lg._load().get("pending_keys") or {}
+
+    def held_fp(self):
+        return lg.key_fingerprint(tc.UID, tc.AUTHKEY, tc.AV_PASSWORD)
+
     def test_only_a_changed_key_counts_as_refreshed(self):
+        # adjusted: the "refreshed" mark is now the guard's persisted pending
+        # fingerprint instead of the per-process _KEY_REFRESHED flag
         tc.resolve_creds()                       # OLDUID -> NEWUID
-        self.assertTrue(tc._KEY_REFRESHED[0])
-        tc._KEY_REFRESHED[0] = False
+        self.assertEqual(self.pending(), {"nursery": self.held_fp()})
+        tc._on_first_frame()                     # the new key delivers video
+        self.assertEqual(self.pending(), {})
         later = tc.time.time() + lg.delay_for(1) + 1
         with mock.patch.object(tc.time, "time", lambda: later):
             self.assertEqual(tc.resolve_creds(), "NEWUID")   # same key again
         self.assertEqual(FakeAPI.calls, 2)
-        self.assertFalse(tc._KEY_REFRESHED[0])
+        self.assertEqual(self.pending(), {})
+        self.assertEqual(lg.status()["attempts"], 1)          # stays charged
+        tc._SUCCESS_RECORDED[0] = False          # next session, video again
+        tc._on_first_frame()
+        self.assertEqual(lg.status()["attempts"], 1)
 
     def test_failed_or_refused_refresh_is_not_a_refreshed_key(self):
         lg.try_acquire()                         # guard in backoff
         tc.resolve_creds()
         self.assertEqual(FakeAPI.calls, 0)
-        self.assertFalse(tc._KEY_REFRESHED[0])
+        self.assertEqual(self.pending(), {})
+
+    def test_pending_key_survives_a_process_restart(self):
+        tc.resolve_creds()                       # login #1 fetches NEWUID
+        self.assertEqual(lg.status()["attempts"], 1)
+        # container restart before any video: no in-process state survives;
+        # the new process starts on the persisted (fetched) key
+        cam = cs.find_camera(cs.load_config(), "nursery")
+        with mock.patch.object(tc, "UID", cam["uid"]), \
+                mock.patch.object(tc, "AUTHKEY", cam["authkey"]), \
+                mock.patch.object(tc, "AV_PASSWORD", cam["av_password"].encode()), \
+                mock.patch.object(tc, "_SUCCESS_RECORDED", [False]), \
+                mock.patch.object(tc, "_SESSION_VIDEO", [False]), \
+                mock.patch.object(tc, "_HAD_VIDEO", [False]):
+            tc._on_first_frame()
+        self.assertEqual(lg.status()["attempts"], 0)
+        self.assertEqual(self.pending(), {})
+
+    def test_saved_key_video_with_other_fingerprint_records_nothing(self):
+        tc.resolve_creds()                       # NEWUID pending, attempts 1
+        fp = self.held_fp()
+        with mock.patch.object(tc, "UID", "OLDUID"), \
+                mock.patch.object(tc, "AUTHKEY", "OLDKEY12"):
+            tc._on_first_frame()                 # video on the old saved key
+        self.assertEqual(lg.status()["attempts"], 1)
+        self.assertEqual(self.pending(), {"nursery": fp})
+
+    def test_second_fetch_supersedes_the_pending_key(self):
+        keys = iter([{"uid": "UIDA", "authkey": "KEYAAAAA"},
+                     {"uid": "UIDB", "authkey": "KEYBBBBB"}])
+        with mock.patch.object(FakeAPI, "camera_credentials",
+                               lambda self, dsn: next(keys)):
+            tc.resolve_creds()
+            fp_a = self.held_fp()
+            later = tc.time.time() + lg.delay_for(1) + 1
+            with mock.patch.object(tc.time, "time", lambda: later):
+                tc.resolve_creds()
+        fp_b = self.held_fp()
+        self.assertNotEqual(fp_a, fp_b)
+        self.assertEqual(self.pending(), {"nursery": fp_b})
+        self.assertFalse(lg.record_video(fp_a))       # superseded: no reset
+        self.assertEqual(lg.status()["attempts"], 2)
+        tc._on_first_frame()                          # video on key B
+        self.assertEqual(lg.status()["attempts"], 0)
+
+    def test_state_file_never_holds_key_material(self):
+        tc.resolve_creds()
+        with open(lg.STATE_PATH) as fh:
+            raw = fh.read()
+        for secret in ("NEWUID", "NEWKEY12", "avpw", "OLDUID", "OLDKEY12"):
+            self.assertNotIn(secret, raw)
+        (fp,) = json.loads(raw)["pending_keys"].values()
+        self.assertRegex(fp, r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(fp, lg.key_fingerprint("NEWUID", "NEWKEY12", b"avpw"))
 
     def test_refresh_kms_0_is_honoured(self):
         with mock.patch.dict(os.environ, {"OWLET_REFRESH_KMS": "0"}):
@@ -250,12 +315,16 @@ class FakeGuard:
     def __init__(self, permits=()):
         self.permits = list(permits)
         self.acquires = 0
-        self.successes = 0
+        self.successes = 0          # resets caused by video on a pending key
+        self.pending = {}           # camera -> fingerprint, like the real file
 
     def module(self):
         mod = types.ModuleType("login_guard")
         mod.try_acquire = self.try_acquire
         mod.record_success = self.record_success
+        mod.key_fingerprint = lg.key_fingerprint
+        mod.set_pending = lambda cam, fp: self.set_pending(cam, fp)
+        mod.record_video = lambda fp: self.record_video(fp)
         return mod
 
     def try_acquire(self, now=None):
@@ -265,6 +334,17 @@ class FakeGuard:
 
     def record_success(self):
         self.successes += 1
+
+    def set_pending(self, camera, fp):
+        self.pending[camera] = fp
+
+    def record_video(self, fp):
+        hits = [c for c, p in self.pending.items() if p == fp]
+        for c in hits:
+            del self.pending[c]
+        if hits:
+            self.record_success()
+        return bool(hits)
 
 
 class ScriptedAPI:
@@ -324,8 +404,6 @@ class ReconnectLifecycleTests(TmpConfig):
                   mock.patch.object(tc, "_SESSION_VIDEO", [False]),
                   mock.patch.object(tc, "_HAD_VIDEO", [False]),
                   mock.patch.object(tc, "_GUARD_ERR_LOGGED", [False]),
-                  mock.patch.object(tc, "_KEY_REFRESHED", [False]),
-                  mock.patch.object(tc, "_SESSION_FRESH_KEY", [False]),
                   mock.patch.object(tc, "log", self.logs.append),
                   mock.patch.object(tc.time, "sleep", sleep),
                   mock.patch.object(tc.time, "monotonic", lambda: self.now[0]),
@@ -406,24 +484,49 @@ class ReconnectLifecycleTests(TmpConfig):
         self.assertEqual(ScriptedAPI.calls, 2)
         self.assertEqual(self.guard.successes, 0)
 
-    def test_fresh_key_counts_only_for_the_next_session(self):
-        # the refreshed key's first session fails; the video comes a session
-        # later (refresh refused by the guard): not this attempt's login
+    def test_fresh_key_counts_until_it_delivers_video(self):
+        # inverted (was test_fresh_key_counts_only_for_the_next_session): the
+        # refreshed key's first session fails (refresh then refused by the
+        # guard), the video comes a session later on that same fetched key;
+        # that login worked, so the escalation is reset, once
         ScriptedAPI.script = self.new_keys(1)
         self.guard.permits = [True, False]
-        self.run_main([(False, 4), (False, 4), (True, 6)])
-        self.assertEqual(self.uids, ["OLDUID", "UID0", "UID0", "UID0"])
-        self.assertEqual(self.guard.successes, 0)
+        self.run_main([(False, 4), (False, 4), (True, 6), (True, 6)])
+        self.assertEqual(self.uids, ["OLDUID", "UID0", "UID0", "UID0", "UID0"])
+        self.assertEqual(self.guard.successes, 1)
+        self.assertEqual(self.guard.pending, {})
 
     def test_success_is_recorded_once_within_a_session(self):
-        # adjusted: only a session on a freshly fetched key records at all
+        # adjusted: only a session on a pending refreshed key records at all
         for _ in range(3):
             tc._on_first_frame()
         self.assertEqual(self.guard.successes, 0)
-        tc._SESSION_FRESH_KEY[0] = True
+        tc._SUCCESS_RECORDED[0] = False          # next session
+        self.guard.pending["nursery"] = lg.key_fingerprint(tc.UID, tc.AUTHKEY,
+                                                           tc.AV_PASSWORD)
         for _ in range(3):
             tc._on_first_frame()
         self.assertEqual(self.guard.successes, 1)
+
+    def test_fetch_then_failed_attempt_then_video_never_blocks(self):
+        # the reviewer's scenario with the real guard and real intervals:
+        # each changed-key fetch is followed by one attempt without video
+        # (a transient connect failure, refresh refused by the backoff, or a
+        # no-video session) and only then by video on that fetched key.
+        # Repeated more often than the default cap of 5 allows.
+        self._use_real_guard(5)
+        rounds = lg.MAX_ATTEMPTS + 3
+        ScriptedAPI.script = self.new_keys(rounds)
+        sessions = [(True, 6)]
+        for n in range(rounds):
+            sessions += [(False, 4), (False, 4 if n % 2 else 6), (True, 6)]
+        self.run_main(sessions)
+        self.assertEqual(ScriptedAPI.calls, rounds)
+        self.assertTrue(all(g >= lg.BASE for g in self.login_gaps()))
+        self.assertFalse(any("cap reached" in m for m in self.logs))
+        self.assertEqual(lg.status()["attempts"], 0)
+        self.assertEqual(lg._load().get("pending_keys"), {})
+        self.assertEqual(self.uids[-1], f"UID{rounds - 1}")
 
     def _use_real_guard(self, max_attempts):
         # the real guard with its real intervals (BASE 60 s); only the cap is
