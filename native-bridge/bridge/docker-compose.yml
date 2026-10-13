@@ -60,6 +60,10 @@ services:
       # password is generated once into /config/secrets/go2rtc.json.
       GO2RTC_USER: "${GO2RTC_USER:-owlet}"
       GO2RTC_PASS: "${GO2RTC_PASS:-}"
+      # Host port you published RTSP on (see the header); empty = RTSP not published.
+      PUBLIC_RTSP_PORT: "${PUBLIC_RTSP_PORT:-}"
+      # host:port ([addr]:port for IPv6) to show in the RTSP link; overrides PUBLIC_RTSP_PORT.
+      OWLET_ADVERTISE_RTSP: "${OWLET_ADVERTISE_RTSP:-}"
     volumes:
       - ${APPDATA:-/mnt/user/appdata/owlet-camera}/config:/config   # settings persist here (same dir as the Unraid template)
       - ./libs:/app/libs      # TUTK .so libs; read-write because the control panel's "Upload & extract" writes them here

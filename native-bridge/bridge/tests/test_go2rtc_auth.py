@@ -155,7 +155,7 @@ class DeploymentFilesTests(unittest.TestCase):
         with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
             for ln in fh:
                 code = ln.split("#", 1)[0].strip()
-                m = re.match(r'^(OWLET_\w+|GO2RTC_\w+):\s*"(.*)"$', code)
+                m = re.match(r'^(OWLET_\w+|GO2RTC_\w+|PUBLIC_\w+):\s*"(.*)"$', code)
                 if m:
                     out[m.group(1)] = m.group(2)
         return out
@@ -174,6 +174,14 @@ class DeploymentFilesTests(unittest.TestCase):
         self.assertEqual(env.get("OWLET_UI_PASS"), "${OWLET_UI_PASS:-}")
         with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
             self.assertNotIn(":?", fh.read())   # nothing is mandatory
+
+    def test_compose_forwards_the_rtsp_endpoint_variables_it_recommends(self):
+        # The header tells host-networked Frigate users to set these; they only
+        # reach the container if the environment block forwards them.
+        env = self._compose_env()
+        for var in ("PUBLIC_RTSP_PORT", "OWLET_ADVERTISE_RTSP"):
+            with self.subTest(var=var):
+                self.assertEqual(env.get(var), "${%s:-}" % var)
 
     def test_compose_config_dir_matches_the_unraid_template(self):
         with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
