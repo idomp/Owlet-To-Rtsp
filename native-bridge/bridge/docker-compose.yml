@@ -15,9 +15,12 @@
 #      is generated once into /config/secrets/go2rtc.json, mode 0600).
 # Credentials and policy switches below come from the shell or an .env file
 # next to this compose file; anything unset falls back to the default shown.
+# (.dockerignore keeps .env and other local secrets out of the build context.)
 #   * WebRTC (8555) is not published.
 # If Frigate runs with host networking instead, publish RTSP to one host IP
-# (e.g. "192.168.1.10:18554:8554") and firewall it to the Frigate host only.
+# (e.g. "<host-ip>:18554:8554"), firewall it to the Frigate host only, and set
+# PUBLIC_RTSP_PORT=18554 so the control panel's RTSP link shows that port
+# (or OWLET_ADVERTISE_RTSP=<host>:18554 to pin the whole address).
 
 name: owlet-bridge
 
@@ -58,7 +61,7 @@ services:
       GO2RTC_USER: "${GO2RTC_USER:-owlet}"
       GO2RTC_PASS: "${GO2RTC_PASS:-}"
     volumes:
-      - ${APPDATA:-/mnt/user/appdata/owlet}/config:/config   # settings persist here
+      - ${APPDATA:-/mnt/user/appdata/owlet-camera}/config:/config   # settings persist here (same dir as the Unraid template)
       - ./libs:/app/libs:ro                                   # TUTK .so libs (from the APK)
     ports:
       - "8088:8088"   # control panel. Prefer "127.0.0.1:8088:8088" + SSH tunnel / auth proxy.

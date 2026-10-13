@@ -79,9 +79,13 @@ KMS fetch, then the new key is saved) happens only when all of these hold:
 * `OWLET_REFRESH_KMS=1` (the default; set `0` to never log in automatically
   and refresh a rotated key with **Connect / refresh key** in the control
   panel instead);
-* the stream start has no saved UID, or a connect / AV‑login failure that a
-  rotated key could explain;
-* this stream start has not already used its one login;
+* there is no saved UID yet (checked once when the stream process starts), or
+  a connection attempt made with the saved key failed at connect or at AV
+  login and delivered no video, which a rotated key could explain (a session
+  that connects but gets no video is the camera's single slot still being
+  held; a new key can't fix that, so it never triggers a login);
+* at most one login per connection attempt, and not within 15 s of the
+  previous key check;
 * the account‑wide login guard allows it: a persistent exponential backoff of
   `OWLET_LOGIN_BACKOFF` (60 s) doubling per attempt up to
   `OWLET_LOGIN_BACKOFF_MAX` (21600 s = 6 h), and a hard cap of

@@ -237,7 +237,7 @@ All controls are in the **🎙️ Talk & sounds** card:
 
 Smart Sock vitals are **off by default** and need `OWLET_VITALS_POLL=1`. The sock poller reads them from Owlet's cloud, and every poll cycle it **writes `APP_ACTIVE=1` to the sock** through that cloud (that poke is what makes the sock stream live vitals, as the Owlet app does). That changes the sock's state on every cycle, so it stays off unless you opt in; the camera's room sensors above are read locally and published regardless.
 
-With `OWLET_VITALS_POLL=1`, open the **🩺 Sensors & vitals** card and click **Probe my devices** (the button is disabled while the poller is off). The bridge pulls heart rate, oxygen, and other Smart Sock vitals from Owlet's cloud and shows them alongside the camera's room sensors. Once probed, readings refresh automatically.
+With `OWLET_VITALS_POLL=1`, open the **🩺 Sensors & vitals** card and click **Probe my devices**. While the poller is off (`OWLET_VITALS_POLL=0`, the default) the control panel greys the button out, its tooltip says *disabled: set OWLET_VITALS_POLL=1 (writes APP_ACTIVE to the sock)*, and the server refuses the call anyway; the camera's room sensors in the same card don't need it. The bridge pulls heart rate, oxygen, and other Smart Sock vitals from Owlet's cloud and shows them alongside the camera's room sensors. Once probed, readings refresh automatically.
 
 ---
 

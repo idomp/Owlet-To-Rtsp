@@ -175,6 +175,18 @@ class DeploymentFilesTests(unittest.TestCase):
         with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
             self.assertNotIn(":?", fh.read())   # nothing is mandatory
 
+    def test_compose_config_dir_matches_the_unraid_template(self):
+        with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
+            compose = fh.read()
+        with open(os.path.join(HERE, "..", "..", "..", "unraid",
+                               "owlet-bridge-native.xml"), encoding="utf-8") as fh:
+            template = fh.read()
+        m = re.search(r'Target="/config" Default="([^"]+)"', template)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "/mnt/user/appdata/owlet-camera/config")
+        self.assertIn("${APPDATA:-/mnt/user/appdata/owlet-camera}/config:/config", compose)
+        self.assertNotRegex(compose, r"appdata/owlet(?!-camera)")
+
     def test_unraid_template_publishes_no_go2rtc_ports(self):
         with open(os.path.join(HERE, "..", "..", "..", "unraid",
                                "owlet-bridge-native.xml"), encoding="utf-8") as fh:
