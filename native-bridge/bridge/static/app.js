@@ -78,11 +78,19 @@ async function testLogin(btn) {
 }
 
 /* ---------- cameras ---------- */
+/* RTSP is reached from other containers on the same Docker network at this
+   container's hostname (it is not published on the Docker host). The go2rtc
+   API (WebRTC/HLS pages) is container-loopback unless GO2RTC_API_LISTEN
+   widens it, so those links are only offered when api_published is true.
+   These strings are always rendered with textContent, never innerHTML. */
+const RTSP_HINT = "PASSWORD = GO2RTC_PASS or the value in /config/secrets/go2rtc.json; "
+  + "reachable from containers on the same Docker network";
 function camUrls(name, s){
-  const host = location.hostname, rp = s.rtsp_port || "8554", hp = s.http_port || "1984";
+  const rhost = s.rtsp_host || "<container-name>", rp = s.rtsp_port || "8554";
+  const host = location.hostname, hp = s.http_port || "1984";
+  const cred = s.rtsp_user ? `${s.rtsp_user}:PASSWORD@` : "";
   return {
-    rtsp: s.rtsp_user ? `rtsp://${s.rtsp_user}:<GO2RTC_PASS>@${host}:${rp}/${name}`
-                      : `rtsp://${host}:${rp}/${name}`,
+    rtsp: `rtsp://${cred}${rhost}:${rp}/${name}`,
     web:  `http://${host}:${hp}/stream.html?src=${name}`,
     hls:  `http://${host}:${hp}/api/stream.m3u8?src=${name}`,
   };
@@ -101,9 +109,10 @@ function buildCard(cam, ports){
       <span class="spacer"></span><span class="stats"></span>
     </div>
     <div class="urls">
-      <div class="url-row"><span class="lbl">RTSP</span><code class="u-rtsp">${u.rtsp}</code><button class="mini copy">copy</button></div>
-      <div class="url-row"><span class="lbl">WebRTC</span><code class="u-web">${u.web}</code><button class="mini copy">copy</button></div>
-      <div class="url-row"><span class="lbl">HLS</span><code class="u-hls">${u.hls}</code><button class="mini copy">copy</button></div>
+      <div class="url-row"><span class="lbl">RTSP</span><code class="u-rtsp"></code><button class="mini copy">copy</button></div>
+      <p class="hint u-hint"></p>
+      <div class="url-row r-web"><span class="lbl">WebRTC</span><code class="u-web"></code><button class="mini copy">copy</button></div>
+      <div class="url-row r-hls"><span class="lbl">HLS</span><code class="u-hls"></code><button class="mini copy">copy</button></div>
     </div>
     <div class="row">
       <button class="connect primary"><span class="spin"></span>↻ Connect / refresh key</button>
@@ -131,6 +140,16 @@ function buildCard(cam, ports){
       </div>
       <div class="row"><button class="save-adv">Save camera settings</button></div>
     </div>`;
+
+  // stream URLs as plain text (copy buttons copy the <code> textContent)
+  el.querySelector(".u-rtsp").textContent = u.rtsp;
+  el.querySelector(".u-hint").textContent = RTSP_HINT;
+  el.querySelector(".u-web").textContent = u.web;
+  el.querySelector(".u-hls").textContent = u.hls;
+  if (ports.api_published !== true) {
+    el.querySelector(".r-web").style.display = "none";
+    el.querySelector(".r-hls").style.display = "none";
+  }
 
   // advanced inputs — set once on creation so polling never clobbers typing
   el.querySelector(".f-dsn").value = cam.camera_dsn || "";

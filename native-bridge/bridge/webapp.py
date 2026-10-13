@@ -361,12 +361,10 @@ def list_cameras():
         })
     return jsonify({
         "cameras": cams,
-        "rtsp_port": PUBLIC_RTSP_PORT, "http_port": PUBLIC_HTTP_PORT,
+        "http_port": PUBLIC_HTTP_PORT,
         "webrtc_port": PUBLIC_WEBRTC_PORT,
-        # go2rtc requires these on RTSP for non-loopback clients (Frigate). The
-        # password itself is never returned; it lives in GO2RTC_PASS or
-        # /config/secrets/go2rtc.json.
-        "rtsp_user": cs.go2rtc_credentials()[0],
+        # rtsp_host/rtsp_user/rtsp_port/api_published: see _stream_endpoints().
+        **_stream_endpoints(),
     })
 
 
@@ -817,6 +815,44 @@ def _watchdog_state():
         return None
 
 
+def _api_published() -> bool:
+    """True only when GO2RTC_API_LISTEN binds the go2rtc API (WebRTC/HLS
+    pages) beyond container loopback. Unset = loopback-only default."""
+    import ipaddress
+    listen = (os.environ.get("GO2RTC_API_LISTEN") or "").strip()
+    if not listen:
+        return False
+    if listen.startswith("["):                 # "[::1]:1984"
+        host = listen[1:].split("]", 1)[0]
+    elif listen.count(":") == 1:               # "127.0.0.1:1984", ":1984"
+        host = listen.split(":", 1)[0]
+    else:
+        host = listen
+    host = host.strip().lower()
+    if not host:
+        return True                            # ":1984" = every interface
+    if host == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True                            # a hostname / interface name
+
+
+def _stream_endpoints() -> dict:
+    """What the UI needs to show a usable RTSP URL. RTSP is not published on
+    the Docker host by the shipped deployment files; other containers on the
+    same user-defined network reach it at this container's hostname on the
+    in-container port. The password is never returned (GO2RTC_PASS or
+    /config/secrets/go2rtc.json)."""
+    return {
+        "rtsp_host": socket.gethostname(),
+        "rtsp_user": cs.go2rtc_credentials()[0],
+        "rtsp_port": str(cs.G_RTSP),
+        "api_published": _api_published(),
+    }
+
+
 @app.get("/api/status")
 def status():
     cfg = cs.load_config()
@@ -832,8 +868,9 @@ def status():
         "cameras": len(cameras),
         "cameras_with_key": with_key,
         "streams_live": live,
-        "rtsp_port": PUBLIC_RTSP_PORT, "http_port": PUBLIC_HTTP_PORT,
+        "http_port": PUBLIC_HTTP_PORT,
         "webrtc_port": PUBLIC_WEBRTC_PORT,
+        **_stream_endpoints(),
         "watchdog": _watchdog_state(),
         "talk_enabled": TALK_ENABLED,
     })
