@@ -111,6 +111,7 @@ class ResolveCredsTests(TmpConfig):
                   mock.patch.object(tc, "_SUCCESS_RECORDED", [False]),
                   mock.patch.object(tc, "_SESSION_VIDEO", [False]),
                   mock.patch.object(tc, "_HAD_VIDEO", [False]),
+                  mock.patch.object(tc, "_GUARD_ERR_LOGGED", [False]),
                   mock.patch.object(tc, "log", lambda *a: None)):
             p.start()
             self.addCleanup(p.stop)
@@ -266,6 +267,7 @@ class ReconnectLifecycleTests(TmpConfig):
                   mock.patch.object(tc, "_SUCCESS_RECORDED", [False]),
                   mock.patch.object(tc, "_SESSION_VIDEO", [False]),
                   mock.patch.object(tc, "_HAD_VIDEO", [False]),
+                  mock.patch.object(tc, "_GUARD_ERR_LOGGED", [False]),
                   mock.patch.object(tc, "log", self.logs.append),
                   mock.patch.object(tc.time, "sleep", lambda s: None),
                   mock.patch.object(tc.time, "monotonic", lambda: next(clock)),
@@ -320,9 +322,53 @@ class ReconnectLifecycleTests(TmpConfig):
         self.assertEqual(self.guard.acquires, 0)
         self.assertTrue(any("previous session had video" in m for m in self.logs))
 
-    def test_video_then_sigterm_records_success_exactly_once(self):
+    def test_success_is_recorded_once_per_session(self):
+        # two sessions with video (the second ends in SIGTERM): one record each,
+        # however many frames each forwarded
         self.run_main([(True, 6), (True, SystemExit(0))])
+        self.assertEqual(self.guard.successes, 2)
+
+    def test_success_is_recorded_once_within_a_session(self):
+        for _ in range(3):
+            tc._on_first_frame()
         self.assertEqual(self.guard.successes, 1)
+
+    def _use_real_guard(self, max_attempts):
+        for obj, name, val in ((lg, "BASE", 0), (lg, "MAX_ATTEMPTS", max_attempts)):
+            p = mock.patch.object(obj, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.dict(sys.modules, {"login_guard": lg})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_successful_rotations_never_exhaust_the_cap(self):
+        # one long-lived process: video, then the key rotates (connect fails),
+        # a refresh fetches the new key and video flows again; repeated more
+        # often than the cap allows logins without video in between
+        cap = 3
+        self._use_real_guard(cap)
+        rounds = cap + 3
+        ScriptedAPI.script = [{"uid": f"UID{i}", "authkey": f"KEY{i:05d}"}
+                              for i in range(rounds)]
+        sessions = [(True, 6)]
+        for _ in range(rounds):
+            sessions += [(False, 4), (True, 6)]
+        self.run_main(sessions)
+        self.assertEqual(ScriptedAPI.calls, rounds)
+        self.assertFalse(any("cap reached" in m for m in self.logs))
+        self.assertEqual(lg.status()["attempts"], 0)
+        self.assertEqual(self.uids[-1], f"UID{rounds - 1}")
+
+    def test_refreshes_without_video_still_count_towards_the_cap(self):
+        cap = 3
+        self._use_real_guard(cap)
+        ScriptedAPI.script = [{"uid": f"UID{i}", "authkey": f"KEY{i:05d}"}
+                              for i in range(cap)]
+        self.run_main([(True, 6)] + [(False, 4)] * (cap + 3))
+        self.assertEqual(ScriptedAPI.calls, cap)
+        self.assertTrue(any("cap reached" in m for m in self.logs))
+        self.assertEqual(lg.status()["attempts"], cap)
 
     def test_video_then_broken_pipe_records_success(self):
         with mock.patch.object(tc, "stream_once",

@@ -1650,13 +1650,18 @@ def av_client_start(av: CDLL, session: int, mode: int) -> int:
 # being able to storm the account.
 _HAD_VIDEO = [False]           # this process has forwarded at least one frame
 _SESSION_VIDEO = [False]       # the current stream_once session has (reset by main)
-_SUCCESS_RECORDED = [False]    # login_guard.record_success() already called
+_SUCCESS_RECORDED = [False]    # record_success() done for this session (reset by main)
+_GUARD_ERR_LOGGED = [False]    # a record_success() failure was already logged
 
 
 def _on_first_frame() -> None:
-    """First forwarded frame of a session. The key evidently works, so (once
-    per process) re-arm the account-wide login guard. Called from the frame
-    loop, so it must never raise."""
+    """First forwarded frame of a session. The key evidently works, so re-arm
+    the account-wide login guard, once per SESSION: a long-lived process may
+    refresh a rotated key on a later connection attempt (each refresh counts
+    against the guard's cap), and the video that follows must re-arm it again,
+    or a few successful rotations would exhaust the cap for good. Called from
+    the frame loop, so it must never raise; a failure is logged once per
+    process."""
     _SESSION_VIDEO[0] = True
     _HAD_VIDEO[0] = True
     if _SUCCESS_RECORDED[0]:
@@ -1666,7 +1671,9 @@ def _on_first_frame() -> None:
         import login_guard
         login_guard.record_success()
     except Exception as e:  # noqa: BLE001
-        log(f"could not reset the login guard after video ({e}); continuing")
+        if not _GUARD_ERR_LOGGED[0]:
+            _GUARD_ERR_LOGGED[0] = True
+            log(f"could not reset the login guard after video ({e}); continuing")
 
 
 def _refresh_allowed() -> bool:
@@ -1793,6 +1800,7 @@ def main() -> None:
         backoff = 5
         try:
             _SESSION_VIDEO[0] = False
+            _SUCCESS_RECORDED[0] = False   # each session re-arms the guard on video
             rc = stream_once(uid, mode)
             if rc == 5:
                 # AV login failed for this security mode — advance to the next.
@@ -1808,9 +1816,9 @@ def main() -> None:
                     "release its session before reconnecting")
             elif rc != 0:
                 log(f"exit rc={rc}; retry in 5s")
-            # login_guard.record_success() already ran at the first forwarded
-            # frame (_on_first_frame), so a SIGTERM or broken pipe after video
-            # still re-arms the guard.
+            # login_guard.record_success() already ran at this session's first
+            # forwarded frame (_on_first_frame), so a SIGTERM or broken pipe
+            # after video still re-arms the guard.
             #
             # At most one refresh per connection attempt, and only when that
             # attempt (made with the key we hold) produced no video AND failed
