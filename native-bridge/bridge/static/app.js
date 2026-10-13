@@ -427,6 +427,7 @@ async function refreshStatus() {
   $("card-cameras").classList.toggle("done", s.streams_live>0);
   updateSetup(s);
   applyTalkGate(s.talk_enabled);
+  applyProbeGate(s.vitals_poll);
 
   const lb = $("libs-banner");
   if (lb) lb.innerHTML = s.have_libs
@@ -504,10 +505,27 @@ function fmtVital(k,v){
   if(m.bool) return (v&&v!=="0")?"On":"Off";
   return v+m.unit;
 }
+/* "Probe my devices" runs the sock cloud snapshot, which the server refuses
+   unless OWLET_VITALS_POLL=1 (status.vitals_poll) because it writes APP_ACTIVE
+   to the sock. Gated like the talk controls. */
+const PROBE_OFF_TITLE = "disabled: set OWLET_VITALS_POLL=1 (writes APP_ACTIVE to the sock)";
+let _vitalsPoll = true;    // until the first /api/status says otherwise
+function applyProbeGate(enabled){
+  _vitalsPoll = enabled !== false;
+  const b = $("btn-probe"); if (!b || b.classList.contains("loading")) return;
+  b.disabled = !_vitalsPoll;
+  if (!_vitalsPoll) b.title = PROBE_OFF_TITLE;
+  else if (b.title === PROBE_OFF_TITLE) b.removeAttribute("title");
+}
 async function probeSensors(btn){
+  if (!_vitalsPoll) return;
   return withLoading(btn, async () => {
     const r = await fetch("/api/vitals/discover",{method:"POST"});
-    if(!r.ok){ toast("Add your Owlet account first.","warn"); return; }
+    if(!r.ok){
+      let err = ""; try { err = (await r.json()).error || ""; } catch(e){}
+      toast(r.status===400 ? "Add your Owlet account first." : ("Probe refused: "+(err||r.status)),"warn");
+      return;
+    }
     toast("Probing your Owlet devices… watch the log.","");
     setTimeout(loadVitals, 4000);
     setTimeout(loadVitals, 9000);

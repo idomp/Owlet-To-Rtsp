@@ -967,6 +967,9 @@ def status():
         **_stream_endpoints(),
         "watchdog": _watchdog_state(),
         "talk_enabled": TALK_ENABLED,
+        # /api/vitals/discover answers 403 unless OWLET_VITALS_POLL=1 (it writes
+        # APP_ACTIVE to the sock); the UI disables "Probe my devices" from this.
+        "vitals_poll": os.environ.get("OWLET_VITALS_POLL", "0") == "1",
     })
 
 

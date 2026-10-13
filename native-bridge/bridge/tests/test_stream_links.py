@@ -116,5 +116,35 @@ class StreamLinkPayloadTests(WebappTestBase):
                                   ["api_published"], True)
 
 
+@unittest.skipUnless(HAVE_FLASK, "flask/requests not installed")
+class StatusGateTests(WebappTestBase):
+    """/api/status tells the panel which opt-in features the server refuses,
+    so it can disable their controls up front (talk, sock probe)."""
+
+    def _status(self, env):
+        clean = {k: v for k, v in os.environ.items() if k != "OWLET_VITALS_POLL"}
+        clean.update(env)
+        with mock.patch.dict(os.environ, clean, clear=True):
+            r = self.c.get("/api/status", headers=_auth())
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()
+
+    def test_vitals_poll_off_by_default(self):
+        j = self._status({})
+        self.assertIs(j["vitals_poll"], False)
+        self.assertIn("talk_enabled", j)
+
+    def test_vitals_poll_reported(self):
+        self.assertIs(self._status({"OWLET_VITALS_POLL": "1"})["vitals_poll"], True)
+        for v in ("0", "", "yes"):
+            with self.subTest(value=v):
+                self.assertIs(self._status({"OWLET_VITALS_POLL": v})["vitals_poll"], False)
+
+    def test_probe_refused_matches_the_flag(self):
+        with mock.patch.dict(os.environ, {"OWLET_VITALS_POLL": "0"}):
+            r = self.c.post("/api/vitals/discover", headers=_auth())
+        self.assertEqual(r.status_code, 403)
+
+
 if __name__ == "__main__":
     unittest.main()
