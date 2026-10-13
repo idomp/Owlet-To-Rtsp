@@ -27,6 +27,9 @@ class FakeMq:
     def ensure(self, s):
         pass
 
+    def set_active_sources(self, sources):
+        self.active = set(sources)
+
     def publish_device(self, d):
         self.devices.append(d)
 
@@ -92,7 +95,9 @@ class PublisherTests(unittest.TestCase):
         mq = FakeMq()
         vp.poll_once(mq, vp._Cloud(lambda *_: None), lambda *_: None)
         self.assertEqual(self.counter, {"api": 0, "snapshot": 0})
+        self.assertEqual(mq.active, {"cam"})   # sock entities get retired
         cams = [d for d in mq.devices if d["kind"] == "cam"]
+        self.assertEqual(cams[0]["source"], "cam")
         self.assertEqual(cams[0]["sensors"],
                          {"temperature": 22, "humidity": 41, "noise": 30, "brightness": 12})
         with open(vp.SNAP) as f:

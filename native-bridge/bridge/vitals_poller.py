@@ -33,6 +33,8 @@ import config_store as cs
 
 POLL = int(os.environ.get("OWLET_VITALS_INTERVAL") or "15")
 SNAP = os.path.join(cs.VITALS_DIR, "snapshot.json")
+# Every MQTT discovery topic the bridge has published (see docs/mqtt.md).
+DISCOVERY_RECORD = os.path.join(cs.VITALS_DIR, "discovery.json")
 
 STATE_PREFIX = "owlet"
 
@@ -89,7 +91,7 @@ class _Mqtt:
     retained last-will "offline" stuck after a reconnect and every Home
     Assistant entity stayed unavailable until the container restarted."""
 
-    def __init__(self, log):
+    def __init__(self, log, record_path: str | None = None):
         self.log = log
         self.c = None
         self._announced: set[str] = set()
@@ -99,6 +101,91 @@ class _Mqtt:
         self._lock = threading.Lock()
         self._key = None          # settings fingerprint we're connected with
         self.prefix = "homeassistant"
+        # Every discovery topic ever published, persisted across restarts, so
+        # entities of a source that is no longer running can be retired.
+        self.record_path = record_path or DISCOVERY_RECORD
+        self._record: dict[str, dict] = self._load_record()
+        self._active: set[str] | None = None   # sources publishing this run
+        self._connected = False
+
+    # -- discovery record + retirement -------------------------------------- #
+    def _load_record(self) -> dict:
+        try:
+            with open(self.record_path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        topics = data.get("topics") if isinstance(data, dict) else None
+        if not isinstance(topics, dict):
+            return {}
+        return {t: e for t, e in topics.items()
+                if isinstance(t, str) and isinstance(e, dict) and e.get("source")}
+
+    def _save_record(self) -> None:
+        """Atomic rewrite of the record (caller holds the lock). Best effort: a
+        read-only /config only loses the ability to retire entities later."""
+        try:
+            os.makedirs(os.path.dirname(self.record_path) or ".", mode=0o700, exist_ok=True)
+            cs._atomic_write(self.record_path,  # noqa: SLF001
+                             json.dumps({"version": 1, "topics": self._record},
+                                        indent=1, sort_keys=True))
+        except OSError as e:
+            self.log(f"[vitals] discovery record write failed: {e}")
+
+    def set_active_sources(self, sources) -> None:
+        """Tell the publisher which sources run this cycle ("cam", "cloud").
+        On the first call and whenever the set changes, entities recorded for a
+        source that is no longer active are retired."""
+        sources = set(sources)
+        with self._lock:
+            changed = sources != self._active
+            self._active = sources
+        if changed:
+            self.retire_inactive()
+
+    def retire_inactive(self) -> int:
+        """Remove every recorded entity whose source is not active: an EMPTY
+        retained payload on its discovery topic (that is how Home Assistant
+        deletes an MQTT-discovered entity), the retained state cleared, and
+        "offline" on its availability topic. Needs a live connection; entries
+        whose publish fails stay recorded and are retried on the next connect.
+        Returns how many discovery topics were cleared."""
+        with self._lock:
+            if self._active is None or self.c is None or not self._connected:
+                return 0
+            gone = {t: e for t, e in self._record.items()
+                    if e.get("source") not in self._active}
+            if not gone:
+                return 0
+            cleared, done_extra = 0, set()
+            for topic, e in sorted(gone.items()):
+                if not self._try_pub(topic, ""):
+                    continue
+                for extra, payload in ((e.get("state"), ""), (e.get("availability"), "offline")):
+                    if extra and extra not in done_extra:
+                        self._try_pub(extra, payload)
+                        done_extra.add(extra)
+                        self._avail.pop(extra, None)
+                        self._last_state.pop(extra, None)
+                del self._record[topic]
+                self._discovery.pop(topic, None)
+                if e.get("uid"):
+                    self._announced.discard(e["uid"])
+                cleared += 1
+            if cleared:
+                self._save_record()
+        if cleared:
+            self.log(f"[vitals] retired {cleared} MQTT entit{'y' if cleared == 1 else 'ies'} "
+                     "of disabled source(s) (empty retained discovery payload)")
+        return cleared
+
+    def _try_pub(self, topic: str, payload: str) -> bool:
+        try:
+            info = self.c.publish(topic, payload, retain=True)
+        except Exception:  # noqa: BLE001
+            return False
+        rc = getattr(info, "rc", 0)
+        return not rc
 
     def ensure(self, s: dict):
         """Connect/disconnect/reconnect to match settings dict `s`. Retries each
@@ -137,6 +224,7 @@ class _Mqtt:
                 c.username_pw_set(s["user"], s.get("password") or "")
             c.will_set(f"{STATE_PREFIX}/bridge/status", "offline", retain=True)
             c.on_connect = self._on_connect
+            c.on_disconnect = self._on_disconnect
             c.connect(s["host"], int(s.get("port") or 1883), 60)
             c.loop_start()
             self.c = c
@@ -153,6 +241,7 @@ class _Mqtt:
         if rc != 0:
             self.log(f"[vitals] MQTT broker refused the connection (rc={rc})")
             return
+        self._connected = True
         client.publish(f"{STATE_PREFIX}/bridge/status", "online", retain=True)
         # The replay is published while HOLDING the lock the publisher uses for
         # its availability cache + publish. Publishing a snapshot after
@@ -166,8 +255,13 @@ class _Mqtt:
                 client.publish(topic, payload, retain=True)
         self.log(f"[vitals] MQTT connected; republished online + {len(replay)} "
                  "discovery/availability message(s)")
+        self.retire_inactive()
+
+    def _on_disconnect(self, *_a):
+        self._connected = False
 
     def _disconnect(self):
+        self._connected = False
         if self.c:
             try:
                 self.c.loop_stop()
@@ -196,6 +290,9 @@ class _Mqtt:
         dsn = dev.get("dsn") or dev.get("name") or "owlet"
         node = self._slug(dsn)
         kind = dev.get("kind", "device")
+        # which publisher this device came from (poll_once tags it): "cam" =
+        # the local camera sidecars, "cloud" = the Ayla sock poller
+        source = dev.get("source") or ("cam" if kind == "cam" else "cloud")
         sensors = _to_us(dev.get("sensors") or {})
         state_topic = f"{STATE_PREFIX}/{node}/state"
         avail_topic = f"{STATE_PREFIX}/{node}/availability"
@@ -242,10 +339,15 @@ class _Mqtt:
                 cfg["payload_off"] = 0
             topic = f"{self.prefix}/{comp}/{uid}/config"
             payload = json.dumps(cfg)
+            entry = {"source": source, "uid": uid, "node": node,
+                     "state": state_topic, "availability": avail_topic}
             with self._lock:
                 self._discovery[topic] = payload
                 self._announced.add(uid)
                 self._pub(topic, payload)
+                if self._record.get(topic) != entry:
+                    self._record[topic] = entry
+                    self._save_record()
         # keys announced for this node earlier but not fresh now -> explicit null
         state = {k: None for k in HA_META
                  if f"owlet_{node}_{k}" in self._announced and k not in fresh}
@@ -347,6 +449,13 @@ def publisher_enabled() -> bool:
     return os.environ.get("OWLET_SENSOR_PUBLISH", "1") != "0"
 
 
+def active_sources() -> set[str]:
+    """The sources whose MQTT entities this run keeps alive: the local camera
+    sidecars always (this process only runs when the publisher is enabled),
+    the Ayla sock poller only when OWLET_VITALS_POLL=1."""
+    return {"cam", "cloud"} if cloud_enabled() else {"cam"}
+
+
 class _Cloud:
     """Sock vitals from the Ayla cloud, polled on its own schedule so a cloud
     outage (and its backoff) never delays the local camera publishing."""
@@ -403,10 +512,17 @@ def poll_once(mq: "_Mqtt", cloud: _Cloud, log, now: float | None = None) -> list
     snapshot.json, HUD overlay text and MQTT. Returns the devices handled."""
     now = time.time() if now is None else now
     cfg = cs.load_config()
+    # before ensure(): the on-connect handler retires entities of sources that
+    # are not in this set (e.g. sock entities once the cloud poller is off)
+    mq.set_active_sources(active_sources())
     mq.ensure(cs.mqtt_settings(cfg))   # pick up UI changes live
     devices = cloud.poll(cfg, now)
+    for d in devices:
+        d.setdefault("source", "cloud")
     # merge live cam sensors from tutk_client sidecars (cloud-independent)
     cam_devs = _read_cam_sidecars(now=now)
+    for c in cam_devs:
+        c["source"] = "cam"
     seen = {d.get("dsn") for d in devices}
     devices += [c for c in cam_devs if c["dsn"] not in seen]
 

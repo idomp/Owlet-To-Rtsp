@@ -69,7 +69,10 @@ class MqttReconnectTests(unittest.TestCase):
         p = mock.patch.dict(sys.modules, _fake_paho())
         p.start()
         self.addCleanup(p.stop)
-        self.m = vp._Mqtt(lambda *_: None)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.record = os.path.join(tmp.name, "discovery.json")
+        self.m = vp._Mqtt(lambda *_: None, record_path=self.record)
         self.m.ensure(SETTINGS)
         self.c = self.m.c
         self.assertIsNotNone(self.c.on_connect, "must register an on_connect handler")
@@ -165,6 +168,90 @@ class MqttReconnectTests(unittest.TestCase):
         self.assertEqual(cfg["availability_mode"], "all")
         self.assertEqual({a["topic"] for a in cfg["availability"]},
                          {"owlet/bridge/status", "owlet/nursery/availability"})
+
+
+class DiscoveryRecordTests(unittest.TestCase):
+    """Discovery topics are recorded in <config>/vitals/discovery.json and the
+    entities of a source that is no longer running are retired."""
+    SOCK_CFG = "homeassistant/sensor/owlet_sock1_heart_rate/config"
+    CAM_CFG = "homeassistant/sensor/owlet_nursery_temperature/config"
+
+    def setUp(self):
+        p = mock.patch.dict(sys.modules, _fake_paho())
+        p.start()
+        self.addCleanup(p.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.record = os.path.join(tmp.name, "vitals", "discovery.json")
+
+    def mqtt(self):
+        m = vp._Mqtt(lambda *_: None, record_path=self.record)
+        m.ensure(SETTINGS)
+        return m, m.c
+
+    def recorded(self):
+        with open(self.record) as f:
+            return json.load(f)["topics"]
+
+    @staticmethod
+    def sock():
+        return {"dsn": "SOCK1", "name": "sock", "kind": "sock", "source": "cloud",
+                "sensors": {"heart_rate": 120}, "ts": 1_700_000_000.0}
+
+    @staticmethod
+    def cam():
+        return {"dsn": "nursery", "name": "nursery", "kind": "cam", "source": "cam",
+                "sensors": {"temperature": 22}, "ts": 1_700_000_000.0}
+
+    def test_published_discovery_topics_are_recorded_with_their_source(self):
+        m, c = self.mqtt()
+        c.on_connect(c, None, {}, 0)
+        m.publish_device(self.cam())
+        m.publish_device(self.sock())
+        rec = self.recorded()
+        self.assertEqual(rec[self.CAM_CFG]["source"], "cam")
+        self.assertEqual(rec[self.SOCK_CFG]["source"], "cloud")
+        self.assertEqual(rec[self.SOCK_CFG]["availability"], "owlet/sock1/availability")
+
+    def test_disabled_sock_poller_entities_are_cleared_and_record_shrinks(self):
+        # run 1: cloud poller on, both sources publish
+        m, c = self.mqtt()
+        m.set_active_sources({"cam", "cloud"})
+        c.on_connect(c, None, {}, 0)
+        m.publish_device(self.cam())
+        m.publish_device(self.sock())
+        self.assertEqual(set(self.recorded()), {self.CAM_CFG, self.SOCK_CFG})
+        # run 2 (restart with OWLET_VITALS_POLL=0): the record survived
+        m2, c2 = self.mqtt()
+        with mock.patch.dict(os.environ, {"OWLET_VITALS_POLL": "0"}):
+            m2.set_active_sources(vp.active_sources())
+        self.assertEqual(c2.pubs, [], "nothing is retired before the broker connects")
+        c2.on_connect(c2, None, {}, 0)
+        self.assertIn((self.SOCK_CFG, "", True), c2.pubs)         # HA deletes the entity
+        self.assertIn(("owlet/sock1/availability", "offline", True), c2.pubs)
+        self.assertIn(("owlet/sock1/state", "", True), c2.pubs)
+        self.assertNotIn((self.CAM_CFG, "", True), c2.pubs)       # active source kept
+        self.assertEqual(set(self.recorded()), {self.CAM_CFG})
+        # retired once: a later reconnect does not clear it again
+        c2.pubs.clear()
+        c2.on_connect(c2, None, {}, 0)
+        self.assertNotIn(self.SOCK_CFG, c2.topics())
+
+    def test_failed_publish_keeps_the_entry_for_the_next_connect(self):
+        m, c = self.mqtt()
+        c.on_connect(c, None, {}, 0)
+        m.publish_device(self.sock())
+        m2, c2 = self.mqtt()
+        c2.publish = lambda *a, **k: types.SimpleNamespace(rc=4)   # MQTT_ERR_NO_CONN
+        c2.on_connect(c2, None, {}, 0)
+        m2.set_active_sources({"cam"})
+        self.assertIn(self.SOCK_CFG, self.recorded())
+
+    def test_active_sources_follow_the_poller_switch(self):
+        with mock.patch.dict(os.environ, {"OWLET_VITALS_POLL": "0"}):
+            self.assertEqual(vp.active_sources(), {"cam"})
+        with mock.patch.dict(os.environ, {"OWLET_VITALS_POLL": "1"}):
+            self.assertEqual(vp.active_sources(), {"cam", "cloud"})
 
 
 class SidecarFreshnessTests(unittest.TestCase):
