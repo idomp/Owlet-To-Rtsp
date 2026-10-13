@@ -18,10 +18,22 @@ import config_store as cs
 
 
 def main() -> int:
-    cfg = cs.load_config()
-    if "--names" in sys.argv:
-        print("\n".join(cs.camera_names(cfg)))
+    if "--names" in sys.argv:   # read-only; the config file is replaced atomically
+        print("\n".join(cs.camera_names(cs.load_config())))
         return 0
+    # Load + render under the shared config lock, so a concurrent save (web UI,
+    # a stream process persisting a refreshed key) can't interleave with it and
+    # leave files rendered from a config that is no longer the saved one.
+    try:
+        with cs.config_lock():
+            return _render()
+    except OSError as e:   # the lock itself (config folder not writable)
+        sys.stderr.write(f"[render] cannot lock the config ({e}); using baked-in default\n")
+        return 1
+
+
+def _render() -> int:
+    cfg = cs.load_config()
     # OWLET_FORGET_ACCOUNT=1: drop stored account credentials at boot once every
     # camera has its key, so the env files below are written without them.
     if cs.forget_account_requested(cfg):

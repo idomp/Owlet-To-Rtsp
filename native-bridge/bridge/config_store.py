@@ -370,6 +370,14 @@ def _config_file_lock():
                 os.close(fd)   # releases the flock
 
 
+def config_lock():
+    """Hold the shared config lock (threads + processes, re-entrant per
+    thread) without a transaction, for a read-then-act sequence that must not
+    interleave with a writer, e.g. load the config and render the files from
+    it. config_transaction() may be used inside it."""
+    return _config_file_lock()
+
+
 @contextlib.contextmanager
 def config_transaction(regenerate: bool = True):
     """Read-modify-write the config under the shared config lock:

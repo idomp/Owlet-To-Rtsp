@@ -235,6 +235,40 @@ class AtomicWriteTests(TmpConfig):
         self.assertEqual(self.leftovers(), [])
 
 
+class RenderStreamsLockTests(TmpConfig):
+    def test_render_waits_for_the_lock_and_renders_the_saved_config(self):
+        import render_streams
+        env_path = os.path.join(cs.CAM_DIR, "nursery.env")
+        result = []
+        done = threading.Event()
+
+        def render():
+            with mock.patch.object(sys, "argv", ["render_streams.py"]), \
+                    mock.patch.object(render_streams.sys, "stderr", mock.Mock()):
+                result.append(render_streams.main())
+            done.set()
+        with cs.config_lock():
+            t = threading.Thread(target=render)
+            t.start()
+            self.assertFalse(done.wait(0.3))   # blocked on the shared lock
+            with cs.config_transaction(regenerate=False) as cfg:
+                cfg["email"] = "user@example.com"
+            with open(env_path) as fh:
+                self.assertNotIn("user@example.com", fh.read())
+        t.join(10)
+        self.assertEqual(result, [0])
+        with open(env_path) as fh:             # rendered from the saved config
+            self.assertIn("OWLET_EMAIL='user@example.com'", fh.read())
+
+    def test_render_fails_cleanly_when_the_lock_is_unavailable(self):
+        import render_streams
+        with mock.patch.object(sys, "argv", ["render_streams.py"]), \
+                mock.patch.object(cs, "_config_file_lock",
+                                  side_effect=cs.ConfigWriteError("read-only")), \
+                mock.patch.object(sys, "stderr"):
+            self.assertEqual(render_streams.main(), 1)
+
+
 class StreamPersistFailureTests(TmpConfig):
     def test_refreshed_key_kept_in_memory_when_persist_fails(self):
         class API:
