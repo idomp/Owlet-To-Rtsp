@@ -512,15 +512,18 @@ function fmtVital(k,v){
 }
 /* "Probe my devices" runs the sock cloud snapshot, which the server refuses
    unless OWLET_VITALS_POLL=1 (status.vitals_poll) because it writes APP_ACTIVE
-   to the sock. Gated like the talk controls. */
+   to the sock. Unlike the talk controls it starts disabled (the probe is off
+   by default) and only the first /api/status that reports vitals_poll=true
+   enables it, so it is never clickable while the server would refuse it. */
 const PROBE_OFF_TITLE = "disabled: set OWLET_VITALS_POLL=1 (writes APP_ACTIVE to the sock)";
-let _vitalsPoll = true;    // until the first /api/status says otherwise
+const PROBE_PENDING_TITLE = "checking whether the sock probe is enabled…";
+let _vitalsPoll = false;   // until the first /api/status says otherwise
 function applyProbeGate(enabled){
-  _vitalsPoll = enabled !== false;
+  _vitalsPoll = enabled === true;
   const b = $("btn-probe"); if (!b || b.classList.contains("loading")) return;
   b.disabled = !_vitalsPoll;
   if (!_vitalsPoll) b.title = PROBE_OFF_TITLE;
-  else if (b.title === PROBE_OFF_TITLE) b.removeAttribute("title");
+  else if (b.title === PROBE_OFF_TITLE || b.title === PROBE_PENDING_TITLE) b.removeAttribute("title");
 }
 async function probeSensors(btn){
   if (!_vitalsPoll) return;
@@ -621,6 +624,8 @@ async function testMqtt(btn){
 
 /* ---------- wire up ---------- */
 $("btn-probe").onclick = (e) => probeSensors(e.currentTarget);
+$("btn-probe").disabled = true;              // refreshStatus() -> applyProbeGate() decides
+$("btn-probe").title = PROBE_PENDING_TITLE;
 $("btn-save-mqtt").onclick = (e) => saveMqtt(e.currentTarget);
 $("btn-test-mqtt").onclick = (e) => testMqtt(e.currentTarget);
 $("btn-save-account").onclick = (e) => saveAccount(e.currentTarget);
