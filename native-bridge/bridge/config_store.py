@@ -814,17 +814,28 @@ def _yaml_str(v: str) -> str:
     # follows, and a document marker after one is a scanner error, which
     # would again leave go2rtc running on its defaults. Escaped, they decode
     # to the characters themselves.
+    # A lone surrogate (what an environment value holding a byte that is not
+    # UTF-8 decodes to) has no spelling go-yaml accepts at all: it rejects
+    # every \uD800-\uDFFF escape ("found invalid Unicode character escape
+    # code") and it cannot be written literally. It becomes U+FFFD, so the
+    # file stays valid and authentication stays on; go2rtc_credentials()
+    # refuses such a password before it gets here.
     out = []
     for ch in json.dumps(str(v), ensure_ascii=False):
         o = ord(ch)
         if ch == "$":
             out.append("\\u0024")
-        elif o == 0x7F or 0x80 <= o <= 0x9F or o in (0x2028, 0x2029) \
-                or 0xD800 <= o <= 0xDFFF or o in (0xFFFE, 0xFFFF):
+        elif 0xD800 <= o <= 0xDFFF:
+            out.append("�")
+        elif o == 0x7F or 0x80 <= o <= 0x9F or o in (0x2028, 0x2029, 0xFFFE, 0xFFFF):
             out.append("\\u%04x" % o)
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _has_lone_surrogate(s: str) -> bool:
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in s)
 
 
 def go2rtc_credentials(create: bool = True) -> tuple[str, str]:
@@ -842,6 +853,15 @@ def go2rtc_credentials(create: bool = True) -> tuple[str, str]:
     logged; read it from that file (or set the env vars)."""
     u = (os.environ.get("GO2RTC_USER") or "").strip()
     p = (os.environ.get("GO2RTC_PASS") or "").strip()
+    if _has_lone_surrogate(u) or _has_lone_surrogate(p):
+        # bytes that are not UTF-8 in the environment: go2rtc could never be
+        # handed this value intact (see _yaml_str), so it is ignored and the
+        # stored/generated credentials apply — never a weaker file
+        import sys
+        print("[config] GO2RTC_USER/GO2RTC_PASS contain bytes that are not UTF-8; "
+              "ignored, using the stored or generated credentials instead",
+              file=sys.stderr, flush=True)
+        u, p = "", ""
     if p:
         return u or G2_USER_DEFAULT, p
     try:

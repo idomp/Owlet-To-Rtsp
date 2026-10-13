@@ -43,6 +43,7 @@ class FakeClient:
         self.will = None
         self._next_mid = 0
         self.inflight = []      # FakeInfo of QoS 1 publishes not yet acknowledged
+        self.calls = []         # lifecycle calls in order
 
     def username_pw_set(self, u, p):
         pass
@@ -51,16 +52,16 @@ class FakeClient:
         self.will = (topic, payload, retain)
 
     def connect(self, host, port, keepalive):
-        pass
+        self.calls.append("connect")
 
     def loop_start(self):
-        pass
+        self.calls.append("loop_start")
 
     def loop_stop(self):
-        pass
+        self.calls.append("loop_stop")
 
     def disconnect(self):
-        pass
+        self.calls.append("disconnect")
 
     def publish(self, topic, payload=None, qos=0, retain=False):
         """paho's signature: qos and retain may come as keywords in any order.
@@ -521,10 +522,23 @@ class SidecarFreshnessTests(unittest.TestCase):
         p2 = mock.patch.object(cs, "camera_names", lambda cfg=None: ["nursery"])
         p2.start()
         self.addCleanup(p2.stop)
+        p3 = mock.patch.object(cs, "load_config", lambda: {"cameras": [{"name": "nursery"}]})
+        p3.start()
+        self.addCleanup(p3.stop)
 
-    def write(self, data):
-        with open(cs.cam_sensors_path("nursery"), "w") as f:
+    def write(self, data, name="nursery"):
+        with open(cs.cam_sensors_path(name), "w") as f:
             json.dump(data, f)
+
+    def test_placeholder_name_is_not_read_when_no_camera_is_configured(self):
+        # camera_names() invents "owlet" for an empty config; a deleted last
+        # camera's sidecar must not come back through it
+        now = 10_000.0
+        self.write({"temperature": 21.5, "ts": now, "field_ts": {"temperature": now}}, name="owlet")
+        with mock.patch.object(cs, "load_config", lambda: {"cameras": []}):
+            self.assertEqual(vp._read_cam_sidecars(now=now), [])
+        with mock.patch.object(cs, "load_config", lambda: {"cameras": [{"name": "owlet"}]}):
+            self.assertEqual([d["dsn"] for d in vp._read_cam_sidecars(now=now)], ["owlet"])
 
     def test_per_field_staleness(self):
         now = 10_000.0
@@ -584,6 +598,21 @@ class TutkSidecarWriterTests(unittest.TestCase):
         self.assertNotIn("humidity", d)
         self.assertNotIn("temperature", d)
         self.assertEqual(d["noise"], 30)
+
+
+class DisconnectOrderTests(unittest.TestCase):
+    """paho's network thread keeps running while QoS 1 messages are
+    unacknowledged and loop_stop() joins it without a timeout, so a settings
+    change must disconnect first and only then stop the loop."""
+
+    def test_settings_change_disconnects_before_stopping_the_loop(self):
+        with mock.patch.dict(sys.modules, _fake_paho()):
+            m = vp._Mqtt(lambda *_: None)
+            m.ensure(SETTINGS)
+            old = m.c
+            m.ensure(dict(SETTINGS, host="other-broker"))
+        self.assertEqual(old.calls, ["connect", "loop_start", "disconnect", "loop_stop"])
+        self.assertIsNot(m.c, old)
 
 
 if __name__ == "__main__":

@@ -338,6 +338,12 @@ class NonAsciiCredentialTests(WebappTestBase):
     def test_creds_match_handles_non_ascii_without_raising(self):
         self.assertTrue(webapp._creds_match(self.N_USER, self.N_PASS, self.N_USER, self.N_PASS))
         self.assertFalse(webapp._creds_match(self.N_USER, "wrong", self.N_USER, self.N_PASS))
+
+    def test_configured_password_with_bytes_that_are_not_utf8_fails_closed(self):
+        # an OWLET_UI_PASS holding a non-UTF-8 byte decodes to a lone surrogate;
+        # it must not raise (which was a 500 on every request), just never match
+        self.assertFalse(webapp._creds_match("u", "pw", "u", "p\udce4w"))
+        self.assertFalse(webapp._creds_match("u", "p�w", "u", "p\udce4w"))
         self.assertFalse(webapp._creds_match("", "", self.N_USER, self.N_PASS))
         self.assertTrue(webapp._creds_match(USER, PASS, USER, PASS))
 

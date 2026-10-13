@@ -48,7 +48,9 @@ class ApiVitalsTests(unittest.TestCase):
                   mock.patch.object(webapp, "_AUTH", {"t": 0.0, "user": "", "pass": ""}),
                   mock.patch.object(webapp, "VITALS_CACHE", self.snap),
                   mock.patch.object(cs, "VITALS_DIR", d),
-                  mock.patch.object(cs, "camera_names", lambda cfg=None: ["nursery", "den"])):
+                  mock.patch.object(cs, "camera_names", lambda cfg=None: ["nursery", "den"]),
+                  mock.patch.object(cs, "load_config",
+                                    lambda: {"cameras": [{"name": "nursery"}, {"name": "den"}]})):
             p.start()
             self.addCleanup(p.stop)
         self.c = webapp.app.test_client()

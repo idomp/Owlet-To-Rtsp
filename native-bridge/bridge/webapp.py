@@ -179,8 +179,12 @@ def _creds_match(given_user: str, given_pw: str, user: str, pw: str) -> bool:
     only hides WHICH bytes differ between equal-length inputs; the encoding
     step and the username-then-password order are not timing-neutral, as
     upstream's version was not either."""
-    return hmac.compare_digest(given_user.encode("utf-8"), user.encode("utf-8")) \
-        and hmac.compare_digest(given_pw.encode("utf-8"), pw.encode("utf-8"))
+    # surrogateescape: a configured value holding bytes that are not UTF-8
+    # (lone surrogates) can never match a request, but must not raise either
+    return hmac.compare_digest(given_user.encode("utf-8", "surrogateescape"),
+                               user.encode("utf-8", "surrogateescape")) \
+        and hmac.compare_digest(given_pw.encode("utf-8", "surrogateescape"),
+                                pw.encode("utf-8", "surrogateescape"))
 
 
 # --------------------------------------------------------------------------- #

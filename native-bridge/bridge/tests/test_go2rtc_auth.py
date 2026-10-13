@@ -174,6 +174,20 @@ class Go2rtcAuthTests(unittest.TestCase):
             self.assertEqual(d[sec]["username"], self.SEPARATOR_CREDS[0])
             self.assertEqual(d[sec]["password"], self.SEPARATOR_CREDS[1])
 
+    # What a GO2RTC_PASS holding a byte that is not UTF-8 decodes to (Python's
+    # surrogateescape): a lone surrogate. go-yaml rejects every \uD800-\uDFFF
+    # escape, and a rejected file leaves go2rtc's API without authentication.
+    LONE_SURROGATE_CREDS = ("u\udce4", "p\udce4w\ud800")
+
+    def test_lone_surrogates_never_become_an_escape_go_yaml_rejects(self):
+        text = cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=self.LONE_SURROGATE_CREDS)
+        self.assertNotIn("\\ud", text.lower())
+        text.encode("utf-8")                       # writable as UTF-8, no surrogate left
+        self.assertIn('password: "p�w�"', text)
+        if HAVE_YAML:
+            d = yaml.load(text, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+            self.assertEqual(d["api"]["username"], "u�")
+
     def test_exec_sources_contain_no_hash(self):
         """go2rtc cuts an exec source at the first '#' to parse its options
         (internal/exec/exec.go); a stray '#' would truncate the command."""
@@ -195,6 +209,18 @@ class Go2rtcCredentialSourceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GO2RTC_USER": "frigate", "GO2RTC_PASS": "s3cret"}):
             self.assertEqual(cs.go2rtc_credentials(), ("frigate", "s3cret"))
         self.assertFalse(os.path.exists(cs.G2_SECRET_PATH))
+
+    def test_env_password_with_bytes_that_are_not_utf8_is_refused_not_weakened(self):
+        import io
+        with mock.patch.dict(os.environ, {"GO2RTC_USER": "frigate", "GO2RTC_PASS": "p\udce4w"}), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            u, p = cs.go2rtc_credentials()
+        self.assertEqual(u, cs.G2_USER_DEFAULT)         # the env pair is ignored as a whole
+        self.assertNotIn("\udce4", p)
+        self.assertGreaterEqual(len(p), 16)              # a generated password applies
+        self.assertTrue(os.path.exists(cs.G2_SECRET_PATH))
+        self.assertIn("not UTF-8", err.getvalue())
+        self.assertNotIn("p\udce4w", err.getvalue())    # the value itself is never logged
 
     def _env(self, **kw):
         env = {k: v for k, v in os.environ.items() if k not in ("GO2RTC_USER", "GO2RTC_PASS")}

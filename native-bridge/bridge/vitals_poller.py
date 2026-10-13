@@ -431,9 +431,15 @@ class _Mqtt:
     def _disconnect(self):
         self._connected = False
         if self.c:
+            # disconnect FIRST: paho's network thread keeps running while QoS 1
+            # messages are unacknowledged, and loop_stop() joins it with no
+            # timeout, so the old order could block the poller for good
+            try:
+                self.c.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 self.c.loop_stop()
-                self.c.disconnect()
             except Exception:  # noqa: BLE001
                 pass
         self.c = None
@@ -579,7 +585,9 @@ def _read_cam_sidecars(now: float | None = None) -> list[dict]:
     unavailable and the HUD is blanked instead of showing old numbers."""
     now = time.time() if now is None else now
     out = []
-    for name in cs.camera_names():
+    # the configured names only: camera_names() invents the placeholder
+    # "owlet" for an empty config, which would read a deleted camera's sidecar
+    for name in [c["name"] for c in cs.load_config().get("cameras") or []]:
         try:
             with open(cs.cam_sensors_path(name)) as f:
                 data = json.load(f)
