@@ -89,7 +89,7 @@ Two volumes: **`/config`** (settings) and **`/app/libs`** (the TUTK libraries).
 
 ### 2 · Make `/config` writable
 
-The container runs as a non‑root (Termux) user, uid **1000**. Give that user the host directory mounted at `/config` (and the one mounted at `/app/libs`, which the UI's library upload writes to) and keep everyone else out — it holds your Owlet password, the camera keys and the RTSP/MQTT credentials. With the Unraid template defaults (`/mnt/user/appdata/owlet-camera/config` and `/mnt/user/appdata/owlet-camera/libs`):
+The published image (built from `Dockerfile.bionic`) runs as a non‑root (Termux) user, uid **1000**. The plain Debian image you can build from `native-bridge/bridge/Dockerfile` runs its processes as root instead: there the `chown` below is unnecessary, but keep the `chmod`. Give that user the host directory mounted at `/config` (and the one mounted at `/app/libs`, which the UI's library upload writes to) and keep everyone else out — it holds your Owlet password, the camera keys and the RTSP/MQTT credentials. With the Unraid template defaults (`/mnt/user/appdata/owlet-camera/config` and `/mnt/user/appdata/owlet-camera/libs`):
 
 ```bash
 mkdir -p /mnt/user/appdata/owlet-camera/config /mnt/user/appdata/owlet-camera/libs
@@ -332,7 +332,7 @@ Everything's set in the web UI; these env vars override or tune it:
 | Symptom | Fix |
 |---|---|
 | **KMS `403 Forbidden`** on diagnose | DSN is wrong — it starts with the **letter `O`** (`OCD…`), not a zero. |
-| **`PermissionError` / settings won't save** | On the host, for the directory mounted at `/config` (Unraid default `/mnt/user/appdata/owlet-camera/config`): `chown -R 1000:1000 <dir> && chmod -R u+rwX,go-rwx <dir>`, restart. Never 777. |
+| **`PermissionError` / settings won't save** | On the host, for the directory mounted at `/config` (Unraid default `/mnt/user/appdata/owlet-camera/config`): `chown -R 1000:1000 <dir> && chmod -R u+rwX,go-rwx <dir>`, restart. Never 777. (uid 1000 is the published Bionic image's user; the Debian `Dockerfile` image runs as root.) |
 | **Frigate can't reach the bridge** (`connection refused` / `no route` / `401`) | Both containers must be on the same user‑defined Docker network (`owlet-net`), and the URL must carry `GO2RTC_USER:GO2RTC_PASS@`. |
 | **Port conflict with Frigate** | None by default: the bridge publishes only `8088`. |
 | **No WebRTC/HLS links, or copy buttons don't work** | WebRTC/HLS links only show when `GO2RTC_API_LISTEN` is widened and you published the ports (`PUBLIC_*` tell the UI which). The RTSP copy URL contains the literal `PASSWORD` — replace it with `GO2RTC_PASS` or the value in `/config/secrets/go2rtc.json`. Clipboard is blocked on plain http; the UI falls back. |
