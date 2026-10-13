@@ -674,12 +674,18 @@ def vitals_latest():
         pass
     except Exception as e:  # noqa: BLE001
         payload = {"ts": None, "devices": [], "error": str(e)}
-    # Merge live cam room-sensors (these update continuously off the stream).
+    # Cam room-sensors: always the freshly filtered sidecar data. The snapshot's
+    # copy of a camera is up to a poll cycle old (arbitrarily old when the
+    # publisher is off), so it is REPLACED, never merged with: a camera whose
+    # fields expired must lose them here, not keep its last values.
     cams = _cam_sensor_devices()
-    if cams:
-        existing = {d.get("dsn") for d in payload.get("devices", [])}
-        payload.setdefault("devices", [])
-        payload["devices"] += [c for c in cams if c["dsn"] not in existing]
+    try:
+        local = set(cs.camera_names())
+    except Exception:  # noqa: BLE001
+        local = set()
+    local.update(c["dsn"] for c in cams)
+    payload["devices"] = [d for d in payload.get("devices") or []
+                          if not (d.get("kind") == "cam" and d.get("dsn") in local)] + cams
     _convert_units(payload.get("devices", []), units)
     payload["units"] = "metric" if units == "metric" else "us"
     return jsonify(payload)
