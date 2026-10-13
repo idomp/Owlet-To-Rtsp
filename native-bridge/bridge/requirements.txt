@@ -1,3 +1,4 @@
 flask>=3.0
 requests>=2.31
 pyyaml>=6.0
+paho-mqtt>=1.6,<2.0   # 2.x changed Client() to require a CallbackAPIVersion; same pin as the Bionic image

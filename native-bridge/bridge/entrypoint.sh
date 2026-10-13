@@ -47,6 +47,15 @@ if [ ! -f "$SSL_DIR/cert.pem" ] || [ ! -f "$SSL_DIR/key.pem" ]; then
   fi
 fi
 
+# Publish the camera's room sensors (from its own P2P session, no cloud) ->
+# snapshot.json (web UI + /api/vitals), the burned-in overlay text and Home
+# Assistant (MQTT, if configured). OWLET_SENSOR_PUBLISH=0 disables it. The
+# Smart Sock cloud poller inside it stays OFF unless OWLET_VITALS_POLL=1 (it
+# writes APP_ACTIVE to the sock every cycle). Same block as start-bionic.sh.
+if [ "${OWLET_SENSOR_PUBLISH:-1}" != "0" ]; then
+  python3 /app/vitals_poller.py &
+fi
+
 # Control panel in background, go2rtc in foreground (PID 1 supervises stream).
 python3 /app/webapp.py &
 exec go2rtc -config "$GO2RTC_CFG"
