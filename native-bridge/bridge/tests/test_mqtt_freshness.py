@@ -105,6 +105,34 @@ class MqttReconnectTests(unittest.TestCase):
         self.m.publish_device(self.cam(temperature=22, humidity=45))
         self.assertIn("owlet/nursery/state", self.c.topics())
 
+    def test_replay_racing_an_offline_flip_leaves_wire_equal_to_cache(self):
+        """The publisher marks the camera offline WHILE the reconnect replay is
+        in progress. Whatever the interleaving, the last availability message
+        on the wire must match the cache (the old code replayed a stale
+        "online" after the publisher's "offline": wire online, cache offline)."""
+        import threading
+        avail = "owlet/nursery/availability"
+        self.m.publish_device(self.cam(temperature=22))      # cache + wire: online
+        flip = {"thread": None}
+        real_publish = self.c.publish
+
+        def publish(topic, payload, retain=False):
+            if topic == avail and flip["thread"] is None:
+                # the poll thread runs mid-replay and flips the camera offline
+                t = threading.Thread(target=self.m.publish_device, args=(self.cam(),))
+                flip["thread"] = t
+                t.start()
+                t.join(0.3)     # blocks on the lock with the fix; finishes without it
+            real_publish(topic, payload, retain)
+
+        self.c.publish = publish
+        self.c.on_connect(self.c, None, {}, 0)
+        flip["thread"].join(5)
+        self.assertFalse(flip["thread"].is_alive())
+        wire = [p for t, p, _r in self.c.pubs if t == avail]
+        self.assertEqual(self.m._avail[avail], "offline")
+        self.assertEqual(wire[-1], self.m._avail[avail])
+
     def test_unchanged_reading_not_republished(self):
         self.m.publish_device(self.cam(temperature=22))
         self.c.pubs.clear()

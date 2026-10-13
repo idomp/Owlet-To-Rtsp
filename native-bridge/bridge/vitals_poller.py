@@ -154,11 +154,16 @@ class _Mqtt:
             self.log(f"[vitals] MQTT broker refused the connection (rc={rc})")
             return
         client.publish(f"{STATE_PREFIX}/bridge/status", "online", retain=True)
+        # The replay is published while HOLDING the lock the publisher uses for
+        # its availability cache + publish. Publishing a snapshot after
+        # releasing it let the publisher flip a device to "offline" in between;
+        # the replay then put the old "online" back on the wire, and since the
+        # cache already said "offline" the correction was never sent.
         with self._lock:
             replay = list(self._discovery.items()) + list(self._avail.items())
             self._last_state.clear()     # next loop re-sends every state payload
-        for topic, payload in replay:
-            client.publish(topic, payload, retain=True)
+            for topic, payload in replay:
+                client.publish(topic, payload, retain=True)
         self.log(f"[vitals] MQTT connected; republished online + {len(replay)} "
                  "discovery/availability message(s)")
 
@@ -196,11 +201,12 @@ class _Mqtt:
         avail_topic = f"{STATE_PREFIX}/{node}/availability"
         fresh = {k: v for k, v in sensors.items() if k in HA_META and v is not None}
         avail = "online" if fresh else "offline"
+        # cache update and publish are one atomic step w.r.t. the reconnect
+        # replay, so the wire can never end up disagreeing with the cache
         with self._lock:
-            changed = self._avail.get(avail_topic) != avail
-            self._avail[avail_topic] = avail
-        if changed:
-            self._pub(avail_topic, avail)
+            if self._avail.get(avail_topic) != avail:
+                self._avail[avail_topic] = avail
+                self._pub(avail_topic, avail)
         if not fresh:
             return
         dev_info = {
@@ -239,7 +245,7 @@ class _Mqtt:
             with self._lock:
                 self._discovery[topic] = payload
                 self._announced.add(uid)
-            self._pub(topic, payload)
+                self._pub(topic, payload)
         # keys announced for this node earlier but not fresh now -> explicit null
         state = {k: None for k in HA_META
                  if f"owlet_{node}_{k}" in self._announced and k not in fresh}
