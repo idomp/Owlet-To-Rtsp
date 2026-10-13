@@ -62,7 +62,7 @@ services:
       GO2RTC_PASS: "${GO2RTC_PASS:-}"
     volumes:
       - ${APPDATA:-/mnt/user/appdata/owlet-camera}/config:/config   # settings persist here (same dir as the Unraid template)
-      - ./libs:/app/libs:ro                                   # TUTK .so libs (from the APK)
+      - ./libs:/app/libs      # TUTK .so libs; read-write because the control panel's "Upload & extract" writes them here
     ports:
       - "8088:8088"   # control panel. Prefer "127.0.0.1:8088:8088" + SSH tunnel / auth proxy.
     networks:

@@ -48,8 +48,8 @@ docker run -d --name owlet-bridge --restart unless-stopped --init --network owle
   -e OWLET_UI_USER='admin' -e OWLET_UI_PASS='<ui password>' \
   -e GO2RTC_USER='owlet' -e GO2RTC_PASS='<rtsp password>' \
   -v /mnt/user/appdata/owlet-camera/config:/config \
-  -v /mnt/user/appdata/owlet-camera/libs:/app/libs:ro \
-  ghcr.io/btoth525/owlet-bridge-native:latest
+  -v /mnt/user/appdata/owlet-camera/libs:/app/libs \
+  ghcr.io/idomp/owlet-bridge-native:latest
 ```
 
 **Or the Unraid template:** Docker → Add Container → paste the
