@@ -1,7 +1,61 @@
 # Build context hygiene for both Dockerfiles in this directory.
+#
+# Dockerfile does `COPY . /app/`, so anything left in this directory ends up in
+# the image. Only source belongs there: credentials, runtime state, the Owlet
+# app and the proprietary libraries must never be baked in.
+#
+# Docker semantics (not .gitignore): a pattern is matched against the path from
+# the context root, so `*.env` would only match at the top level. File patterns
+# below use `**/` to match at any depth; a matching directory excludes its
+# whole contents.
+
+# Tests and caches
 tests/
-__pycache__/
 **/__pycache__/
-*.pyc
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.venv*/
+**/venv/
+
+# Credentials: compose .env files, owlet.env, keys and certificates
+**/.env
+**/.env.*
+**/*.env
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+**/secrets/
+**/ssl/
+# JSON is never source here; at runtime it is secrets (ui.json, go2rtc.json,
+# login-guard.json) or per-camera state.
+**/*.json
+docker-compose.override.yml
+compose.override.yml
+
+# Runtime state that belongs in the /config volume, not the image
+**/config/
+**/owlet.yaml
+**/*.gen.yaml
+**/cameras/
+**/uploads/
+**/*.log
+
+# The Owlet app and its unpacked bundle (proprietary; supplied by the user)
+**/*.apk
+**/*.apkm
+**/*.xapk
+**/*.apks
+**/bundle/
+
 # Proprietary TUTK libraries are mounted at /app/libs, never baked into an image.
-libs/**/*.so
+**/*.so
+
+# Local captures and scratch files
+**/frame*.png
+**/*.scratch
+**/captures/
+**/mitm-data/
+**/frida-server-*

@@ -8,6 +8,7 @@ redirected into a temp dir and stub `python3`/`go2rtc`/`openssl` executables
 Run:  python3 -m unittest discover -s native-bridge/bridge/tests -v
 """
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -24,14 +25,149 @@ def _read(name):
         return fh.read()
 
 
+def _docker_rule_regex(pattern):
+    """One .dockerignore pattern as a regex, following Docker's documented
+    semantics (moby/patternmatcher): matched against the slash-separated path
+    from the context root, leading/trailing slashes dropped, `*` and `?` never
+    cross a `/`, `**` matches any number of directories (including none)."""
+    pat = pattern.strip("/")
+    out, i = "", 0
+    while i < len(pat):
+        ch = pat[i]
+        if pat.startswith("**/", i):
+            out += "(?:.*/)?"
+            i += 3
+            continue
+        if pat.startswith("**", i):
+            out += ".*"
+            i += 2
+            continue
+        if ch == "*":
+            out += "[^/]*"
+        elif ch == "?":
+            out += "[^/]"
+        elif ch == "[":
+            j = pat.find("]", i)
+            out += pat[i:j + 1] if j > i else re.escape(ch)
+            i = (j if j > i else i)
+        else:
+            out += re.escape(ch)
+        i += 1
+    return re.compile(out + r"\Z")
+
+
+def _ignore_rules():
+    rules = []
+    for ln in _read(".dockerignore").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        neg = ln.startswith("!")
+        rules.append((neg, _docker_rule_regex(ln[1:] if neg else ln)))
+    return rules
+
+
+def _ignored(path, rules=None):
+    """True when `path` (relative to the bridge dir) stays out of the build
+    context: the last rule matching the path or one of its parent directories
+    decides, like `docker build` does."""
+    rules = _ignore_rules() if rules is None else rules
+    parts = path.strip("/").split("/")
+    prefixes = ["/".join(parts[:n]) for n in range(1, len(parts) + 1)]
+    out = False
+    for neg, rx in rules:
+        if any(rx.match(p) for p in prefixes):
+            out = not neg
+    return out
+
+
+# Things that can sit in the bridge directory on a user's machine and must
+# never reach an image built with `COPY . /app/`.
+SENSITIVE = (
+    ".env", ".env.local", "owlet.env", "secrets.env", "sub/dir/.env",
+    "secrets/go2rtc.json", "secrets/ui.json", "login-guard.json", "go2rtc.json",
+    "config/owlet.yaml", "config/secrets/ui.json", "owlet.yaml",
+    "go2rtc.gen.yaml", "cameras/owlet.json",
+    "cert.pem", "ssl/key.pem", "tls.key", "server.crt", "store.p12",
+    "owlet.apk", "Owlet.apkm", "owlet.xapk", "owlet.apks", "uploads/a1b2.apk",
+    "bundle/lib/x86_64/libIOTCAPIs.so", "libs/x86_64/libIOTCAPIs.so", "libAVAPIs.so",
+    ".venv/bin/python", ".venv-cam/lib/site.py", "venv/bin/python",
+    "tutk.log", "tutk-owlet.log", "logs/watchdog.log",
+    "tests/test_debian_image.py", "__pycache__/webapp.cpython-312.pyc", "webapp.pyc",
+    "docker-compose.override.yml", "frame01.png",
+)
+
+
+def _bridge_files():
+    """Every file under the bridge dir, as context-relative paths."""
+    out = []
+    for root, dirs, files in os.walk(BRIDGE):
+        dirs[:] = [d for d in dirs if d not in ("__pycache__",)]
+        for f in files:
+            out.append(os.path.relpath(os.path.join(root, f), BRIDGE).replace(os.sep, "/"))
+    return out
+
+
+class DockerignoreTests(unittest.TestCase):
+    def test_matcher_follows_docker_semantics(self):
+        rules = [(False, _docker_rule_regex("*.env"))]
+        self.assertTrue(_ignored("a.env", rules))
+        self.assertFalse(_ignored("sub/a.env", rules))       # no `**/`: root only
+        rules = [(False, _docker_rule_regex("**/*.env"))]
+        self.assertTrue(_ignored("a.env", rules))
+        self.assertTrue(_ignored("sub/a.env", rules))
+        rules = [(False, _docker_rule_regex("secrets/"))]
+        self.assertTrue(_ignored("secrets/x/y.json", rules))  # dir excludes contents
+        rules = [(False, _docker_rule_regex("*.json")),
+                 (True, _docker_rule_regex("keep.json"))]
+        self.assertFalse(_ignored("keep.json", rules))        # last match wins
+
+    def test_sensitive_paths_are_excluded(self):
+        rules = _ignore_rules()
+        for path in SENSITIVE:
+            with self.subTest(path=path):
+                self.assertTrue(_ignored(path, rules), f"{path} would be baked into the image")
+
+    def test_source_stays_in_the_context(self):
+        # The Debian image needs every module, template and script.
+        rules = _ignore_rules()
+        for path in _bridge_files():
+            if path.startswith("tests/") or path.endswith((".so", ".pyc")):
+                continue
+            if path.endswith((".py", ".sh", ".js", ".css", ".html", ".txt")) \
+                    or path in ("go2rtc.yaml", "Dockerfile", "Dockerfile.bionic"):
+                with self.subTest(path=path):
+                    self.assertFalse(_ignored(path, rules), f"{path} is source but ignored")
+
+    def test_bionic_copy_list_is_not_ignored(self):
+        # Dockerfile.bionic copies an explicit list; every file in it must
+        # survive the shared .dockerignore or that build breaks.
+        rules = _ignore_rules()
+        sources = []
+        for ln in _read("Dockerfile.bionic").splitlines():
+            ln = ln.strip()
+            if not ln.startswith("COPY ") or "--from=" in ln:
+                continue
+            sources.extend(ln.split()[1:-1])
+        self.assertIn("webapp.py", sources)
+        self.assertIn("templates", sources)
+        for src in sources:
+            full = os.path.join(BRIDGE, src)
+            self.assertTrue(os.path.exists(full), f"COPY source {src} missing")
+            if os.path.isdir(full):
+                files = [p for p in _bridge_files() if p.startswith(src.rstrip("/") + "/")]
+                self.assertTrue(files, f"{src}/ is empty")
+            else:
+                files = [src]
+            for f in files:
+                with self.subTest(path=f):
+                    self.assertFalse(_ignored(f, rules), f"Dockerfile.bionic copies {f}")
+
+
 class DockerfileTests(unittest.TestCase):
     def test_copies_the_whole_bridge_directory(self):
+        # Why the .dockerignore above matters.
         self.assertIn("COPY . /app/", _read("Dockerfile"))
-
-    def test_dockerignore_keeps_tests_and_tutk_libs_out(self):
-        lines = [ln.strip() for ln in _read(".dockerignore").splitlines()]
-        self.assertIn("tests/", lines)
-        self.assertIn("libs/**/*.so", lines)
 
     def test_entrypoint_uses_generated_config(self):
         src = _read("entrypoint.sh")
