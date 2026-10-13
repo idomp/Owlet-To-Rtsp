@@ -806,14 +806,20 @@ def _yaml_str(v: str) -> str:
     # YAML parser rejects as an invalid escape; go2rtc then logs the error and
     # carries on with its defaults, i.e. an API with no authentication. Literal
     # UTF-8 is valid YAML. What YAML does not allow unescaped (DEL, the C1
-    # controls except NEL, surrogates, U+FFFE/U+FFFF) is escaped by hand; the
-    # C0 controls, quotes and backslashes are already escaped by json.dumps.
+    # controls, surrogates, U+FFFE/U+FFFF) is escaped by hand; the C0
+    # controls, quotes and backslashes are already escaped by json.dumps.
+    # NEL (U+0085), LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR (U+2029)
+    # are YAML-printable, but go-yaml's scanner treats them as line breaks
+    # inside a quoted scalar: it folds them, strips the indentation that
+    # follows, and a document marker after one is a scanner error, which
+    # would again leave go2rtc running on its defaults. Escaped, they decode
+    # to the characters themselves.
     out = []
     for ch in json.dumps(str(v), ensure_ascii=False):
         o = ord(ch)
         if ch == "$":
             out.append("\\u0024")
-        elif o == 0x7F or (0x80 <= o <= 0x9F and o != 0x85) \
+        elif o == 0x7F or 0x80 <= o <= 0x9F or o in (0x2028, 0x2029) \
                 or 0xD800 <= o <= 0xDFFF or o in (0xFFFE, 0xFFFF):
             out.append("\\u%04x" % o)
         else:

@@ -150,11 +150,29 @@ class Go2rtcAuthTests(unittest.TestCase):
             self.assertEqual(d[sec]["password"], self.ASTRAL_CREDS[1])
 
     def test_yaml_str_escapes_what_yaml_forbids_unescaped(self):
-        # DEL, the C1 controls (NEL excepted) and U+FFFE are not YAML-printable;
-        # the dollar sign is escaped for go2rtc; NEL and ordinary text stay as is.
-        self.assertEqual(cs._yaml_str("a\x7fb\x85c\x9fd￾e$"),
-                         '"a\\u007fb\x85c\\u009fd\\ufffee\\u0024"')
+        # DEL, the C1 controls and U+FFFE are not YAML-printable; the dollar
+        # sign is escaped for go2rtc; the Unicode line breaks NEL, LS and PS
+        # are escaped because go-yaml folds them inside quoted scalars;
+        # ordinary text, quotes and backslashes come out as JSON would.
+        self.assertEqual(cs._yaml_str("a\x7fb\x85c\x9fd￾e$f g "),
+                         '"a\\u007fb\\u0085c\\u009fd\\ufffee\\u0024f\\u2028g\\u2029"')
         self.assertEqual(cs._yaml_str('q"b\\sé'), '"q\\"b\\\\sé"')
+
+    # Line-separator characters that go-yaml's scanner treats as line breaks
+    # inside a double-quoted scalar: folded, indentation after them dropped,
+    # and a document marker after one is a scanner error.
+    SEPARATOR_CREDS = ("p\x85w", "p --- x   y")
+
+    @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+    def test_line_separator_creds_round_trip_through_a_strict_yaml_parser(self):
+        text = cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=self.SEPARATOR_CREDS)
+        for ch in ("\x85", " ", " "):
+            self.assertNotIn(ch, text)
+        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+        d = yaml.load(text, Loader=loader)
+        for sec in ("api", "rtsp"):
+            self.assertEqual(d[sec]["username"], self.SEPARATOR_CREDS[0])
+            self.assertEqual(d[sec]["password"], self.SEPARATOR_CREDS[1])
 
     def test_exec_sources_contain_no_hash(self):
         """go2rtc cuts an exec source at the first '#' to parse its options
