@@ -1409,7 +1409,8 @@ def stream_once(uid: str, sec_mode: int) -> int:
                 # 2 MB .raw copy of the whole buffer every frame (matters at 25fps).
                 out.write(memoryview(buf)[:actual.value]); out.flush()
                 frames += 1
-                _HAD_VIDEO[0] = True
+                if not _SESSION_VIDEO[0]:
+                    _on_first_frame()
                 last_data = time.time()
                 vclock["video_at"] = last_data
                 vclock["frames"] = frames
@@ -1641,11 +1642,31 @@ def av_client_start(av: CDLL, session: int, mode: int) -> int:
 
 
 # Login-storm brake (see login_guard.py): at most ONE automatic Firebase
-# password login per stream process, and only when the account-wide guard
-# allows it (exponential backoff, hard cap OWLET_LOGIN_MAX_ATTEMPTS).
-MAX_LOGINS_PER_START = 1
-_LOGINS_THIS_PROCESS = [0]
-_HAD_VIDEO = [False]           # set by stream_once on the first forwarded frame
+# password login per connection attempt, never after a connection that
+# delivered video, and only when the account-wide guard allows it
+# (exponential backoff, hard cap OWLET_LOGIN_MAX_ATTEMPTS). The guard state is
+# shared by every stream process and survives relaunches, so a long-lived
+# process can refresh a rotated key once the backoff has elapsed without
+# being able to storm the account.
+_HAD_VIDEO = [False]           # this process has forwarded at least one frame
+_SESSION_VIDEO = [False]       # the current stream_once session has (reset by main)
+_SUCCESS_RECORDED = [False]    # login_guard.record_success() already called
+
+
+def _on_first_frame() -> None:
+    """First forwarded frame of a session. The key evidently works, so (once
+    per process) re-arm the account-wide login guard. Called from the frame
+    loop, so it must never raise."""
+    _SESSION_VIDEO[0] = True
+    _HAD_VIDEO[0] = True
+    if _SUCCESS_RECORDED[0]:
+        return
+    _SUCCESS_RECORDED[0] = True
+    try:
+        import login_guard
+        login_guard.record_success()
+    except Exception as e:  # noqa: BLE001
+        log(f"could not reset the login guard after video ({e}); continuing")
 
 
 def _refresh_allowed() -> bool:
@@ -1654,14 +1675,15 @@ def _refresh_allowed() -> bool:
 
 def resolve_creds(refresh: bool = True) -> str:
     """Return the camera UID, optionally refreshing UID/AuthKey/AV-password
-    from the Owlet KMS first.
+    from the Owlet KMS first. Makes at most ONE cloud login per call, and
+    main() calls it at most once per connection attempt.
 
     The saved key is the default. A cloud refresh (a full Firebase *password*
     login + KMS fetch) happens only when ALL of these hold:
       * `refresh` (main() asks only at a start with no saved UID, or after a
-        connect / AV-login failure that a rotated key could explain);
+        connection attempt that produced no video and failed in a way a
+        rotated key could explain);
       * OWLET_REFRESH_KMS is not "0" and DSN + account credentials exist;
-      * this process has not used its one login yet (MAX_LOGINS_PER_START);
       * login_guard allows it (account-wide exponential backoff + hard cap,
         shared by every stream process and surviving relaunches).
     A fetched key is persisted to the config (config_store.persist_camera_key),
@@ -1672,9 +1694,9 @@ def resolve_creds(refresh: bool = True) -> str:
     email = os.environ.get("OWLET_EMAIL")
     pw = os.environ.get("OWLET_PASSWORD")
     region = os.environ.get("OWLET_REGION", "world")
-    want = refresh and _refresh_allowed() and dsn and email and pw
-    if want and _LOGINS_THIS_PROCESS[0] >= MAX_LOGINS_PER_START:
-        log("KMS refresh skipped: this stream start already used its one login")
+    want = bool(refresh and dsn and email and pw)
+    if want and not _refresh_allowed():
+        log("KMS refresh skipped (refresh disabled: OWLET_REFRESH_KMS=0); using the saved key")
         want = False
     if want:
         try:
@@ -1686,7 +1708,6 @@ def resolve_creds(refresh: bool = True) -> str:
             log(f"KMS refresh skipped ({why}); using the saved key")
             want = False
     if want:
-        _LOGINS_THIS_PROCESS[0] += 1
         try:
             from owlet_api import OwletAPI
             api = OwletAPI(region, email, pw, log=lambda m: log(m))
@@ -1756,7 +1777,6 @@ def main() -> None:
     # Saved key first; log in at start only if there is no saved UID at all.
     uid = resolve_creds(refresh=not UID)
     last_kms = time.monotonic()
-    video_recorded = False
     # Security mode to try. If pinned via env, use only that; otherwise cycle
     # [Auto, Dtls, Simple] across reconnects — each on a FRESH session so a
     # failed DTLS handshake on one mode can't poison the next attempt.
@@ -1766,6 +1786,7 @@ def main() -> None:
         mode = modes[i % len(modes)]
         backoff = 5
         try:
+            _SESSION_VIDEO[0] = False
             rc = stream_once(uid, mode)
             if rc == 5:
                 # AV login failed for this security mode — advance to the next.
@@ -1781,21 +1802,24 @@ def main() -> None:
                     "release its session before reconnecting")
             elif rc != 0:
                 log(f"exit rc={rc}; retry in 5s")
-            if _HAD_VIDEO[0] and not video_recorded:
-                # a session delivered video: the key works, re-arm the guard
-                video_recorded = True
-                try:
-                    import login_guard
-                    login_guard.record_success()
-                except Exception:  # noqa: BLE001
-                    pass
-            # Only a connect (4) or AV-login (5) failure can be a rotated key. A
-            # no-video session (6) is the camera's slot still being held — a new
-            # key can't fix that, so it never triggers a login. resolve_creds()
-            # enforces the one-login-per-start cap and the account-wide backoff.
-            if rc in (4, 5) and time.monotonic() - last_kms >= 15:
-                uid = resolve_creds()
-                last_kms = time.monotonic()
+            # login_guard.record_success() already ran at the first forwarded
+            # frame (_on_first_frame), so a SIGTERM or broken pipe after video
+            # still re-arms the guard.
+            #
+            # At most one refresh per connection attempt, and only when that
+            # attempt (made with the key we hold) produced no video AND failed
+            # at connect (4) or AV login (5), which a rotated key could
+            # explain. A no-video session (6) is the camera's slot still being
+            # held; a new key can't fix that. resolve_creds() then applies
+            # OWLET_REFRESH_KMS and the account-wide backoff/cap.
+            if rc in (4, 5):
+                if _SESSION_VIDEO[0]:
+                    log("KMS refresh skipped (previous session had video; the key works)")
+                elif time.monotonic() - last_kms >= 15:
+                    uid = resolve_creds()
+                    last_kms = time.monotonic()
+                else:
+                    log("KMS refresh skipped (last key check under 15s ago)")
         except SystemExit:
             raise
         except BrokenPipeError:
