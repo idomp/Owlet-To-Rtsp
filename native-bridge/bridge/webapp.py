@@ -919,52 +919,67 @@ def _request_hostname() -> str:
     return f"[{host}]" if ":" in host else host
 
 
-_ADV_HOST_RE = re.compile(r"[A-Za-z0-9._-]+")
+# One DNS label: letters, digits, hyphens; 1-63 chars; no leading/trailing hyphen.
+_ADV_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+_ADV_PORT_RE = re.compile(r"[1-9][0-9]{0,4}")          # ASCII digits, no leading zero
+_ADV_IPV6_RE = re.compile(r"\[([0-9A-Fa-f:.]+)\]")     # no zone id
 _adv_rejected: set = set()   # malformed OWLET_ADVERTISE_RTSP values already logged
 
 
-def _parse_advertised(v: str):
-    """Validate a whole "host:port" authority -> (host, port) or None.
+def _check_advertised(v: str):
+    """Validate a whole "host:port" authority -> ((host, port), None) or
+    (None, reason). The reason names the rule that failed and never contains
+    any part of the value (it can hold a pasted password).
 
-    Accepted: a DNS name or IPv4 address, or a bracketed IPv6 literal, then a
-    port in 1-65535. Rejected: no port, userinfo, path/query/fragment,
-    whitespace, an unbracketed IPv6 literal, any other character."""
+    Accepted: a DNS name (valid labels) or IPv4 address, or a bracketed IPv6
+    literal, then ":" and a port in 1-65535. Anything else is rejected,
+    including a user@ part, any "/", "?" or "#" (even with nothing after it)
+    and whitespace."""
     import ipaddress
-    if not v or any(c.isspace() for c in v):
-        return None
-    try:
-        u = urlparse("//" + v)
-        host, port = u.hostname, u.port        # .port raises on junk / out of range
-    except ValueError:
-        return None
-    if (not host or not port or u.path or u.params or u.query or u.fragment
-            or "@" in u.netloc):
-        return None
-    if u.netloc.rsplit(":", 1)[-1] != str(port):   # "+8554", "08554", non-ASCII digits
-        return None
-    if u.netloc.startswith("["):
+    if not v:
+        return None, "the value is empty"
+    if any(c.isspace() for c in v):
+        return None, "it contains whitespace"
+    if "@" in v:
+        return None, "it contains a user@ part (credentials do not belong in it)"
+    if any(c in v for c in "/?#"):
+        return None, "it contains a path, query or fragment (/, ? or #)"
+    host, sep, port = v.rpartition(":")
+    if not sep or not host:
+        return None, "it is not host:port"
+    if not _ADV_PORT_RE.fullmatch(port) or int(port) > 65535:
+        return None, "the port is not a number in 1-65535"
+    if host.startswith("["):
+        m = _ADV_IPV6_RE.fullmatch(host)
         try:
-            if ipaddress.ip_address(host).version != 6:
-                return None
+            if not m or ipaddress.ip_address(m.group(1)).version != 6:
+                raise ValueError
         except ValueError:
-            return None
-        return f"[{host}]", str(port)
-    if not _ADV_HOST_RE.fullmatch(host):      # also catches unbracketed IPv6
-        return None
-    return host, str(port)
+            return None, "the bracketed host is not an IPv6 address"
+        return (f"[{m.group(1).lower()}]", port), None
+    if ":" in host:
+        return None, "an IPv6 address must be written in brackets, [addr]:port"
+    labels = host.split(".")
+    if len(host) > 253 or not all(_ADV_LABEL_RE.fullmatch(x) for x in labels):
+        return None, ("the host is not a valid DNS name or IPv4 address (labels of "
+                      "letters, digits and hyphens, 1-63 characters, no leading or "
+                      "trailing hyphen)")
+    return (host.lower(), port), None
 
 
 def _rtsp_advertised():
     """OWLET_ADVERTISE_RTSP="host:port" -> (host, port), else None. A malformed
-    value is logged once and ignored, so the next precedence level applies."""
+    value is ignored, so the next precedence level applies, and the rule it
+    broke is logged once -- never the value itself, which may hold a password
+    someone pasted (rtsp://user:pass@host:port)."""
     v = (os.environ.get("OWLET_ADVERTISE_RTSP") or "").strip()
     if not v:
         return None
-    parsed = _parse_advertised(v)
+    parsed, reason = _check_advertised(v)
     if parsed is None and v not in _adv_rejected:
         _adv_rejected.add(v)
-        print(f"[webapp] ignoring OWLET_ADVERTISE_RTSP={v!r}: expected host:port "
-              "(IPv6 as [addr]:port, no user@, path, query or spaces)", flush=True)
+        print(f"[webapp] ignoring OWLET_ADVERTISE_RTSP: {reason}; expected host:port "
+              "(IPv6 as [addr]:port)", flush=True)
     return parsed
 
 

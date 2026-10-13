@@ -6,6 +6,8 @@ reported as rtsp_mode and rtsp_published) and only
 offers WebRTC/HLS links when api_published is true (go2rtc API widened with
 GO2RTC_API_LISTEN). Skipped when Flask/requests aren't installed.
 """
+import contextlib
+import io
 import os
 import unittest
 from unittest import mock
@@ -98,6 +100,13 @@ class StreamLinkPayloadTests(WebappTestBase):
         "cams.example:+8554", "cams.example:８５５４", "cams.exa%41mple:8554",
         "cams.example,b:8554", "2001:db8::7:8554", "2001:db8::7", "[2001:db8::7]",
         "[cams.example]:8554", "[192.0.2.7]:8554", "[2001:db8::7:8554",
+        # a trailing "?" or "#" with nothing after it
+        "cams.example:8554?", "cams.example:8554#", "cams.example:8554/",
+        # host labels must be DNS labels
+        "home_lab.example:8554", "-cams.example:8554", "cams-.example:8554",
+        "cams..example:8554", ".cams.example:8554", "cams.example.:8554",
+        ("a" * 64) + ".example:8554", "cams.example:08554",
+        "[fe80::1%eth0]:8554", "[2001:db8::7]:8554:1",
     )
 
     def test_malformed_advertise_falls_back(self):
@@ -120,12 +129,37 @@ class StreamLinkPayloadTests(WebappTestBase):
                 self._get("/api/status", {"OWLET_ADVERTISE_RTSP": "cams.example/x:8554"})
         lines = [c for c in p.call_args_list if "OWLET_ADVERTISE_RTSP" in str(c)]
         self.assertEqual(len(lines), 1)
+        self.assertIn("path, query or fragment", str(lines[0]))
+
+    def test_rejected_advertise_value_is_never_logged(self):
+        secret = "S3ntinel-Pa55w0rd"
+        values = (f"rtsp://viewer:{secret}@cams.example:8554",
+                  f"viewer:{secret}@cams.example:8554",
+                  f"{secret}@cams.example:8554",
+                  f"cams.example:8554?password={secret}",
+                  f"cams.example:8554#{secret}",
+                  f"{secret}_x.example:8554",
+                  f"{secret}.example:{secret}",
+                  f"[{secret}]:8554")
+        webapp._adv_rejected.clear()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            for v in values:
+                with self.subTest(advertise=v):
+                    j = self._get("/api/status", {"OWLET_ADVERTISE_RTSP": v})
+                    self.assertEqual(j["rtsp_mode"], "network")
+        logged = out.getvalue() + err.getvalue()
+        self.assertEqual(logged.count("ignoring OWLET_ADVERTISE_RTSP"), len(values))
+        for part in (secret, secret.lower(), "viewer", "cams.example"):
+            self.assertNotIn(part, logged)
 
     def test_valid_advertise_forms(self):
         for v, want in (("[::1]:8554", ("[::1]", "8554")),
                         ("[2001:DB8::7]:18554", ("[2001:db8::7]", "18554")),
+                        ("[::ffff:192.0.2.7]:8554", ("[::ffff:192.0.2.7]", "8554")),
                         ("192.0.2.7:8554", ("192.0.2.7", "8554")),
-                        ("cam-1.home_lab.example:65535", ("cam-1.home_lab.example", "65535"))):
+                        ("Cams.Example:1", ("cams.example", "1")),
+                        ("cam-1.home-lab.example:65535", ("cam-1.home-lab.example", "65535"))):
             with self.subTest(advertise=v):
                 j = self._get("/api/status", {"OWLET_ADVERTISE_RTSP": v})
                 self.assertEqual(j["rtsp_mode"], "advertised")
