@@ -134,14 +134,24 @@ class _Mqtt:
 
     def set_active_sources(self, sources) -> None:
         """Tell the publisher which sources run this cycle ("cam", "cloud").
-        On the first call and whenever the set changes, entities recorded for a
-        source that is no longer active are retired."""
+        Called every poll cycle: whenever an entity recorded for a source that
+        is no longer active is still waiting to be retired, retirement is
+        retried here -- not only when the set changes, so a pass that could not
+        run (no connection yet, a failed publish) is picked up on the next
+        cycle instead of waiting for the next reconnect."""
         sources = set(sources)
         with self._lock:
-            changed = sources != self._active
             self._active = sources
-        if changed:
+            pending = self._retire_pending_locked()
+        if pending:
             self.retire_inactive()
+
+    def _retire_pending_locked(self) -> bool:
+        """True while a recorded entity of an inactive source is still waiting
+        to be retired (caller holds the lock)."""
+        if self._active is None:
+            return False
+        return any(e.get("source") not in self._active for e in self._record.values())
 
     def retire_inactive(self) -> int:
         """Remove every recorded entity whose source is not active: an EMPTY
@@ -226,8 +236,15 @@ class _Mqtt:
             c.on_connect = self._on_connect
             c.on_disconnect = self._on_disconnect
             c.connect(s["host"], int(s.get("port") or 1883), 60)
-            c.loop_start()
+            # Assigned BEFORE the network loop starts: a fast CONNACK runs
+            # _on_connect on paho's thread, and its retirement pass needs
+            # self.c (it returned early when the client was set afterwards).
             self.c = c
+            try:
+                c.loop_start()
+            except Exception:
+                self.c = None
+                raise
             self.log(f"[vitals] MQTT connecting to {s['host']}:{s.get('port')}")
         except Exception as e:  # noqa: BLE001
             self.log(f"[vitals] MQTT connect failed ({e}); will retry")

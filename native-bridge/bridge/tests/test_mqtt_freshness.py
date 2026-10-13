@@ -50,9 +50,18 @@ class FakeClient:
         return [t for t, _p, _r in self.pubs]
 
 
-def _fake_paho():
+class SyncConnectClient(FakeClient):
+    """A broker that answers at once: the CONNACK callback runs inside
+    loop_start(), before ensure() has returned."""
+
+    def loop_start(self):
+        if self.on_connect:
+            self.on_connect(self, None, {}, 0)
+
+
+def _fake_paho(client_cls=FakeClient):
     client_mod = types.ModuleType("paho.mqtt.client")
-    client_mod.Client = FakeClient
+    client_mod.Client = client_cls
     paho = types.ModuleType("paho")
     mqtt = types.ModuleType("paho.mqtt")
     paho.mqtt = mqtt
@@ -246,6 +255,34 @@ class DiscoveryRecordTests(unittest.TestCase):
         c2.on_connect(c2, None, {}, 0)
         m2.set_active_sources({"cam"})
         self.assertIn(self.SOCK_CFG, self.recorded())
+
+    def test_immediate_connack_still_retires(self):
+        m, c = self.mqtt()
+        c.on_connect(c, None, {}, 0)
+        m.publish_device(self.sock())
+        # restart with the poller off; the broker answers inside loop_start()
+        with mock.patch.dict(sys.modules, _fake_paho(SyncConnectClient)):
+            m2 = vp._Mqtt(lambda *_: None, record_path=self.record)
+            m2.set_active_sources({"cam"})     # poll_once order: before ensure()
+            m2.ensure(SETTINGS)
+        c2 = m2.c
+        self.assertIsInstance(c2, SyncConnectClient)
+        self.assertIn((self.SOCK_CFG, "", True), c2.pubs)
+        self.assertIn(("owlet/sock1/availability", "offline", True), c2.pubs)
+
+    def test_failed_pass_is_retried_on_the_next_poll_cycle(self):
+        m, c = self.mqtt()
+        c.on_connect(c, None, {}, 0)
+        m.publish_device(self.sock())
+        m2, c2 = self.mqtt()
+        m2.set_active_sources({"cam"})
+        real = c2.publish
+        c2.publish = lambda *a, **k: types.SimpleNamespace(rc=4)   # MQTT_ERR_NO_CONN
+        c2.on_connect(c2, None, {}, 0)
+        self.assertNotIn((self.SOCK_CFG, "", True), c2.pubs)
+        c2.publish = real
+        m2.set_active_sources({"cam"})     # unchanged set, next poll cycle
+        self.assertIn((self.SOCK_CFG, "", True), c2.pubs)
 
     def test_active_sources_follow_the_poller_switch(self):
         with mock.patch.dict(os.environ, {"OWLET_VITALS_POLL": "0"}):
