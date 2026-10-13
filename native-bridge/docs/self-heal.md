@@ -76,8 +76,9 @@ reconnect and relaunch uses the **saved** camera key (UID / AuthKey / AV
 password in the config). A cloud key refresh (one Firebase password login +
 KMS fetch, then the new key is saved) happens only when all of these hold:
 
-* `OWLET_REFRESH_KMS=1` (the default `0` never logs in automatically; refresh
-  the key with **Connect / refresh key** in the control panel instead);
+* `OWLET_REFRESH_KMS=1` (the default; set `0` to never log in automatically
+  and refresh a rotated key with **Connect / refresh key** in the control
+  panel instead);
 * the stream start has no saved UID, or a connect / AV‑login failure that a
   rotated key could explain;
 * this stream start has not already used its one login;

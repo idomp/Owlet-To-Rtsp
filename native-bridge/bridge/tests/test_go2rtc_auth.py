@@ -162,7 +162,7 @@ class DeploymentFilesTests(unittest.TestCase):
 
     def test_compose_policy_switches_are_overridable_with_safe_defaults(self):
         env = self._compose_env()
-        for var, default in (("OWLET_REFRESH_KMS", "0"), ("OWLET_FORGET_ACCOUNT", "0"),
+        for var, default in (("OWLET_REFRESH_KMS", "1"), ("OWLET_FORGET_ACCOUNT", "0"),
                              ("OWLET_VITALS_POLL", "0"), ("OWLET_WATCHDOG", "0"),
                              ("OWLET_TALK", "0")):
             with self.subTest(var=var):

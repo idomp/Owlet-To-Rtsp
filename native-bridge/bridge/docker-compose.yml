@@ -45,8 +45,11 @@ services:
       OWLET_VITALS_POLL: "${OWLET_VITALS_POLL:-0}"
       # 1 = enable the stream self-heal watchdog (restarts stalled streams)
       OWLET_WATCHDOG: "${OWLET_WATCHDOG:-0}"
-      # 1 = allow automatic Owlet cloud logins to refresh a rotated camera key (rate-limited)
-      OWLET_REFRESH_KMS: "${OWLET_REFRESH_KMS:-0}"
+      # 1 (default) = after a connect / AV-login failure the bridge may log in to the
+      #     Owlet cloud once to refresh a rotated camera key, bounded by a persistent
+      #     backoff and attempt cap. 0 = never log in automatically (strictest): a rotated
+      #     key is then refreshed by hand with "Connect / refresh key" in the control panel.
+      OWLET_REFRESH_KMS: "${OWLET_REFRESH_KMS:-1}"
       # 1 = blank the stored Owlet email/password once every configured camera has a key.
       #     Add ALL cameras first; adding one later needs the account re-entered in the control panel.
       OWLET_FORGET_ACCOUNT: "${OWLET_FORGET_ACCOUNT:-0}"
