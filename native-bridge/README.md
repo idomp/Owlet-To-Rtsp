@@ -36,7 +36,8 @@ extract them from the Owlet APK you own into the libs folder:
 # on any machine with the apk + unzip
 native-bridge/bridge/extract-libs.sh /path/to/owlet.apk x86_64
 # -> libIOTCAPIs.so, libAVAPIs.so, libTUTKGlobalAPIs.so, libP2PTunnelAPIs.so, libRDTAPIs.so
-# put that x86_64/ folder under  /mnt/user/appdata/owlet/libs/  on Unraid
+# put that x86_64/ folder in the host directory mounted at /app/libs
+# (Unraid template default: /mnt/user/appdata/owlet-camera/libs/)
 ```
 
 **Prebuilt image (terminal):**

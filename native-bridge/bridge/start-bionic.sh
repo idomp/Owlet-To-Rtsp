@@ -14,8 +14,9 @@ mkdir -p /config /config/vitals 2>/dev/null
 if [ ! -f /config/owlet.env ]; then
   if ! (echo "# owlet-bridge" > /config/owlet.env) 2>/dev/null; then
     echo "[owlet-bridge/bionic] WARN: /config is not writable by this container."
-    echo "[owlet-bridge/bionic]   Settings won't persist. The container runs as uid 1000; on Unraid run:"
-    echo "[owlet-bridge/bionic]     chown -R 1000:1000 /mnt/user/appdata/owlet && chmod -R u+rwX,go-rwx /mnt/user/appdata/owlet"
+    echo "[owlet-bridge/bionic]   Settings won't persist. The container runs as uid 1000; on the host, for the"
+    echo "[owlet-bridge/bionic]   directory mounted at /config (Unraid default /mnt/user/appdata/owlet-camera/config), run:"
+    echo "[owlet-bridge/bionic]     chown -R 1000:1000 <dir> && chmod -R u+rwX,go-rwx <dir>"
     echo "[owlet-bridge/bionic]   (never chmod 777 — the folder holds your Owlet password and camera keys)"
     echo "[owlet-bridge/bionic]   then restart this container."
   fi
