@@ -21,7 +21,7 @@ No phone. No Android emulator. No cloud relay. It talks to the camera directly o
 
 ## What you get
 
-- 🦉 **A single container** — drop in your Owlet login, get `rtsp://<host>:8554/owlet`.
+- 🦉 **A single container** — drop in your Owlet login, get an authenticated RTSP stream (`rtsp://<user>:<password>@<container-name>:8554/<camera>`) for Frigate on the same Docker network.
 - 🌐 **A friendly web UI** — status dashboard, in‑browser APK upload, one‑click "Add & connect," live logs.
 - 🏠 **100% local video** — once connected, frames go camera → bridge directly over your LAN; they never touch Owlet's or ThroughTek's servers.
 - 🎙️ **Two‑way audio** — hold‑to‑talk into the room (from any browser), play uploaded MP3/WAV/AAC files, or trigger the camera's **built‑in lullabies and soothing sounds** (with a hardware sleep timer) — all reverse‑engineered from the app, byte‑for‑byte.
@@ -78,7 +78,7 @@ It is **secure by default**: only the control panel is published.
 
 | Service | Host port | Container port | Notes |
 |---|---|---|---|
-| Control panel | `8088` | `8088` | HTTP Basic auth |
+| Control panel | `8088` | `8088` | HTTPS (self‑signed certificate) + Basic auth |
 | go2rtc API / video UI | *not published* | `1984` | bound to container loopback: the API can rewrite go2rtc's config and run commands |
 | **RTSP** | *not published* | `8554` | Frigate pulls it over a **shared Docker network**, with go2rtc credentials |
 | WebRTC | *not published* | `8555` | |
@@ -101,7 +101,7 @@ chmod -R u+rwX,go-rwx /mnt/user/appdata/owlet-camera
 
 ### 3 · Provide the TUTK libraries (in the browser)
 
-The proprietary ThroughTek `.so` libraries aren't shipped — you supply your own copy of the Owlet app. Open the control panel at **`http://<unraid-ip>:8088`**, go to the **🧩 TUTK libraries** card, click **Upload & extract**, and pick your Owlet **`.apkm`** (or `.apk`). The bridge pulls the five x86‑64 libraries out of it for you.
+The proprietary ThroughTek `.so` libraries aren't shipped — you supply your own copy of the Owlet app. Open the control panel at **`https://<unraid-ip>:8088`**. The bridge generates a **self‑signed certificate** on first start, so the browser warns once — accept it (plain HTTP is only a last‑resort fallback when no certificate can be made). Log in with `OWLET_UI_USER` / `OWLET_UI_PASS` if you set them; otherwise the user is `admin` and the password is generated once into `/config/secrets/ui.json` (0600; on Unraid `/mnt/user/appdata/owlet-camera/config/secrets/ui.json`) — the container log names that file, never the password. Go to the **🧩 TUTK libraries** card, click **Upload & extract**, and pick your Owlet **`.apkm`** (or `.apk`). The bridge pulls the five x86‑64 libraries out of it for you.
 
 > These libraries are Android binaries linked against Bionic libc, so glibc can't load them. The image runs a **Termux (Bionic) userspace** so they load on a normal x86‑64 Linux kernel — no Android, no `binder`/`ashmem`, no privileged mode.
 
@@ -169,7 +169,7 @@ docker run -d --name owlet-bridge --restart unless-stopped --network owlet-net \
 
 **docker compose:** see [`native-bridge/bridge/docker-compose.yml`](native-bridge/bridge/docker-compose.yml).
 
-The `PUBLIC_*` vars just tell the UI which host ports you mapped, so the copy‑URLs and the "Open video UI" button point to the right place.
+The control panel's RTSP copy URL uses the container's hostname and in‑container port, i.e. what another container on the same Docker network connects to. The WebRTC/HLS links only appear if you widen `GO2RTC_API_LISTEN`; `PUBLIC_HTTP_PORT` / `PUBLIC_WEBRTC_PORT` then tell the UI which host ports you published.
 
 ---
 
@@ -177,12 +177,15 @@ The `PUBLIC_*` vars just tell the UI which host ports you mapped, so the copy‑
 
 ### Self‑healing streams
 The camera's single P2P session can silently wedge (video stops, audio keeps
-flowing). Three layers put it back without you touching anything: the stream
-process notices its own frame clock stopping (~30 s) and reconnects; the
-container watchdog restarts just that camera's stream process if it doesn't
-(2 min); and only as a last, rate‑limited resort restarts the container. Live
-counters are in `/api/status` → `watchdog`. Details, timings and the field data
-behind them: [docs/self-heal.md](native-bridge/docs/self-heal.md).
+flowing). The stream process always watches its own frame clock: the in‑process
+stall supervisor notices video stopping (~30 s, `OWLET_STALL_TIMEOUT`) and
+unblocks/reconnects the stream itself. The outer container watchdog is **off by
+default** (`OWLET_WATCHDOG=0`) until it has been validated on your hardware; with
+`OWLET_WATCHDOG=1` it additionally restarts just that camera's stream process if
+the stream stays dead (2 min) and, only as a last, rate‑limited resort, restarts
+the container. With it enabled, live counters are in `/api/status` → `watchdog`.
+Details, timings and the field data behind them:
+[docs/self-heal.md](native-bridge/docs/self-heal.md).
 
 ### Two‑way audio (talk‑back)
 
@@ -220,7 +223,7 @@ Temperature rides every single video frame in the extended frame‑info struct �
 
 ### Home Assistant / MQTT
 
-Enable MQTT in the **🏠 Home Assistant** card. Every sensor above is published with Home Assistant MQTT discovery — entities appear automatically in your HA instance (no manual YAML). Temperatures are published in °F.
+Enable MQTT in the **🏠 Home Assistant** card. Every sensor above is published with Home Assistant MQTT discovery — entities appear automatically in your HA instance (no manual YAML). Temperatures are published in °F. Topics, payloads and broker settings: [docs/mqtt.md](native-bridge/docs/mqtt.md).
 
 ### Camera controls
 
@@ -232,7 +235,9 @@ All controls are in the **🎙️ Talk & sounds** card:
 
 ### Vitals / Smart Sock
 
-Open the **🩺 Sensors & vitals** card and click **Probe my devices**. The bridge pulls heart rate, oxygen, and other Smart Sock vitals from Owlet's cloud and shows them alongside the camera's room sensors. Once probed, readings refresh automatically.
+Smart Sock vitals are **off by default** and need `OWLET_VITALS_POLL=1`. The sock poller reads them from Owlet's cloud, and every poll cycle it **writes `APP_ACTIVE=1` to the sock** through that cloud (that poke is what makes the sock stream live vitals, as the Owlet app does). That changes the sock's state on every cycle, so it stays off unless you opt in; the camera's room sensors above are read locally and published regardless.
+
+With `OWLET_VITALS_POLL=1`, open the **🩺 Sensors & vitals** card and click **Probe my devices** (the button is disabled while the poller is off). The bridge pulls heart rate, oxygen, and other Smart Sock vitals from Owlet's cloud and shows them alongside the camera's room sensors. Once probed, readings refresh automatically.
 
 ---
 
@@ -294,8 +299,8 @@ Everything's set in the web UI; these env vars override or tune it:
 | Var | Default | Meaning |
 |---|---|---|
 | `OWLET_UI_USER` / `OWLET_UI_PASS` | `admin` / *(generated)* | control‑panel login. Auth is **always on**; with no password set, a random one is written to `/config/secrets/ui.json` (0600) and only that path is logged |
-| `OWLET_REFRESH_KMS` | `1` | `0` = never log in to the Owlet cloud automatically; streams use only the saved camera key |
-| `OWLET_LOGIN_BACKOFF` / `OWLET_LOGIN_BACKOFF_MAX` / `OWLET_LOGIN_MAX_ATTEMPTS` | `60` / `21600` / `5` | automatic key refresh is rare by design: the saved key is used first; a refresh (one Firebase password login + KMS fetch) only follows a connect / AV‑login failure, at most **once per stream start**, with account‑wide exponential backoff (60 s, 120 s, 240 s …, max 6 h). After **5** attempts without a session that delivers video, automatic logins stop until a manual *Connect / refresh key* succeeds. State: `/config/secrets/login-guard.json` |
+| `OWLET_REFRESH_KMS` | `0` | `0` = never log in to the Owlet cloud automatically; streams use only the saved camera key. `1` allows the bounded automatic key refresh described in the next row |
+| `OWLET_LOGIN_BACKOFF` / `OWLET_LOGIN_BACKOFF_MAX` / `OWLET_LOGIN_MAX_ATTEMPTS` | `60` / `21600` / `5` | automatic key refresh (only with `OWLET_REFRESH_KMS=1`) is rare by design: the saved key is used first; a refresh (one Firebase password login + KMS fetch) only follows a connect / AV‑login failure, at most **once per stream start**, with account‑wide exponential backoff (60 s, 120 s, 240 s …, max 6 h). After **5** attempts without a session that delivers video, automatic logins stop until a manual *Connect / refresh key* succeeds. State: `/config/secrets/login-guard.json` |
 | `OWLET_FORGET_ACCOUNT` | `0` | `1` = once every camera has a saved key, blank the Owlet email/password in `/config/owlet.yaml` (also settable as `"forget_account": "1"` there). No cloud logins can happen afterwards; to re‑provision, unset it and re‑enter the account |
 | `OWLET_VITALS_POLL` | `0` | Smart Sock cloud poller. **It writes `APP_ACTIVE=1` to the sock through Owlet's cloud every cycle — leave it off.** The camera's room sensors don't need it; the *Probe my devices* button is disabled too while it is off |
 | `OWLET_SENSOR_PUBLISH` | `1` | publish the camera's room sensors (temperature, humidity, noise, brightness, Wi‑Fi — read from the camera's own P2P session, no cloud) to `/api/vitals`, the HUD and MQTT |
@@ -304,7 +309,7 @@ Everything's set in the web UI; these env vars override or tune it:
 | `GO2RTC_USER` / `GO2RTC_PASS` | `owlet` / *(generated)* | credentials go2rtc requires on RTSP and its API for every non‑loopback client (`api.username`/`api.password`, `rtsp.username`/`rtsp.password`). Unset password = random one kept in `/config/secrets/go2rtc.json` (0600) |
 | `GO2RTC_API_LISTEN` | `127.0.0.1:1984` | go2rtc API bind address. Keep it on loopback; `:1984` only if you publish it deliberately |
 | `GO2RTC_RTSP_LISTEN` | `:8554` | RTSP bind address inside the container (reached by Frigate over the shared Docker network) |
-| `PUBLIC_RTSP_PORT` | `8554` | the port shown in the UI's copy URL |
+| `PUBLIC_RTSP_PORT` | `8554` | not used for the copy URL any more: the UI shows the in‑container RTSP port (`GO2RTC_RTSP_PORT`), which is what containers on the shared network connect to |
 | `OWLET_KEEPALIVE` | `1` | keep one camera session warm 24/7 (auto‑reconnect). **Leave on.** |
 | `OWLET_SESSION_CHECK` | `0` | experimental: log the TUTK session mode (P2P/relay) after each connect — crashed the stream process on the reference camera's lib build, keep off unless debugging |
 | `OWLET_STALL_TIMEOUT` | `30` | seconds without a video frame before the stream process unblocks/relaunches itself (see [Self‑healing](native-bridge/docs/self-heal.md)) |
@@ -327,9 +332,9 @@ Everything's set in the web UI; these env vars override or tune it:
 | **`PermissionError` / settings won't save** | On the host, for the directory mounted at `/config` (Unraid default `/mnt/user/appdata/owlet-camera/config`): `chown -R 1000:1000 <dir> && chmod -R u+rwX,go-rwx <dir>`, restart. Never 777. |
 | **Frigate can't reach the bridge** (`connection refused` / `no route` / `401`) | Both containers must be on the same user‑defined Docker network (`owlet-net`), and the URL must carry `GO2RTC_USER:GO2RTC_PASS@`. |
 | **Port conflict with Frigate** | None by default: the bridge publishes only `8088`. |
-| **"Open video UI" / copy buttons don't work** | Set the `PUBLIC_*` env vars and pull `:latest` (clipboard is blocked on plain http — the new UI falls back). |
+| **No WebRTC/HLS links, or copy buttons don't work** | WebRTC/HLS links only show when `GO2RTC_API_LISTEN` is widened and you published the ports (`PUBLIC_*` tell the UI which). The RTSP copy URL contains the literal `PASSWORD` — replace it with `GO2RTC_PASS` or the value in `/config/secrets/go2rtc.json`. Clipboard is blocked on plain http; the UI falls back. |
 | **Stream pops in and out** | Close the **Owlet app on all phones** — the cam allows one session and they fight. Keep `OWLET_KEEPALIVE` on. Check `docker exec owlet-bridge-native tail -50 /config/tutk.log`. |
-| **Video freezes a minute or two after (re)connecting, audio keeps going** | A wedged TUTK session with the stream's main thread blocked. The bridge now fixes this itself in ~30–90 s (`[stall]` lines in `/config/tutk-<camera>.log` show what was blocked); the container watchdog backs that up. See [Self‑healing](native-bridge/docs/self-heal.md) — and open `/api/status` → `watchdog` for live counters. |
+| **Video freezes a minute or two after (re)connecting, audio keeps going** | A wedged TUTK session with the stream's main thread blocked. The bridge now fixes this itself in ~30–90 s (`[stall]` lines in `/config/tutk-<camera>.log` show what was blocked) — this in‑process stall supervisor is always on. The outer container watchdog is off by default; set `OWLET_WATCHDOG=1` if you want it as a backup, then `/api/status` → `watchdog` shows live counters. See [Self‑healing](native-bridge/docs/self-heal.md). |
 | **High CPU in Frigate** | Disable **birdseye** for the Owlet camera — it was decoding the full 1440p feed for the mosaic. |
 | **`MISSING …libIOTCAPIs.so`** | Upload your Owlet APK in the **TUTK libraries** card (or drop it in the config folder). |
 | **🎤 mic button is greyed out** | The browser requires HTTPS for microphone access. Open the panel on `https://` and accept the self‑signed cert warning. |
@@ -346,7 +351,7 @@ Everything's set in the web UI; these env vars override or tune it:
 
 **Does it survive a reboot / power loss?** Yes — `--restart unless-stopped` brings the container back and the keepalive reconnects the camera automatically.
 
-**Can I add multiple cameras?** Yes — add each one by DSN in the Cameras card. Each gets its own RTSP stream at `rtsp://<host>:8554/<camera-name>`.
+**Can I add multiple cameras?** Yes — add each one by DSN in the Cameras card. Each gets its own RTSP stream at `rtsp://<GO2RTC_USER>:<GO2RTC_PASS>@<container-name>:8554/<camera-name>`, reachable from containers on the same user‑defined Docker network (RTSP is not published on the host).
 
 **Why no motion alerts?** The Owlet app delivers motion and sound *push* alerts via Firebase Cloud Messaging — a cloud service, not the local camera link. These can't be reproduced locally. Use the live **sound level** sensor in Home Assistant to build automations instead.
 

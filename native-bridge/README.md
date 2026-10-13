@@ -64,7 +64,13 @@ docker compose up -d --build
 
 ## Use it
 
-1. Open **`http://<host>:8088`**.
+1. Open **`https://<host>:8088`**. The bridge serves HTTPS with a self-signed
+   certificate it generates on first start, so accept the browser warning once
+   (plain HTTP is only a last-resort fallback when no certificate can be made).
+   Log in with `OWLET_UI_USER` / `OWLET_UI_PASS` if set; otherwise the user is
+   `admin` and the password is generated into `/config/secrets/ui.json` (0600)
+   in the host directory mounted at `/config` — the log names the file, never
+   the password.
 2. Enter your Owlet **email / password**, pick **region**, and put your camera
    **DSN** (e.g. `OCD…`) in the *Camera DSN* field.
 3. Click **Connect & Diagnose** — the camera UID / AuthKey / AV password

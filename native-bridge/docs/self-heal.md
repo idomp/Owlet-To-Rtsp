@@ -55,15 +55,40 @@ back-pressure; the spare swap sidesteps it regardless of cause.
 
 | Layer | Where | Trigger | Action | Typical time to video |
 |---|---|---|---|---|
-| **0 · frame loop** | `tutk_client.py` main thread | `avRecvFrameData2` returns *no data* for `OWLET_NO_VIDEO_TIMEOUT` (15 s) | returns, waits `OWLET_RECONNECT_WAIT` (25 s), reconnects with a fresh KMS key | ~45 s |
+| **0 · frame loop** | `tutk_client.py` main thread | `avRecvFrameData2` returns *no data* for `OWLET_NO_VIDEO_TIMEOUT` (15 s) | returns, waits `OWLET_RECONNECT_WAIT` (25 s), reconnects with the **saved** camera key (no cloud login; see *Camera key and cloud logins* below) | ~45 s |
 | **1 · stall supervisor** *(new)* | `tutk_client.py` side thread | no video frame forwarded for `OWLET_STALL_TIMEOUT` (30 s) **and** layer 0 didn't fire → the main thread is blocked | logs the main thread's kernel wait channel + a stack dump of every thread; calls `avClientStop()` to break a receive blocked in the lib → layer 0 takes over and reconnects cleanly; if the thread still isn't back after `OWLET_STALL_UNBLOCK_WAIT` (8 s) → aliases the camera's go2rtc stream to an unused spare (`PATCH /api/streams`), kills the ffmpeg on our stdout pipe (found by pipe inode), then `os._exit` so the stream relaunches | ~40–90 s |
 | **2 · container watchdog, stage 1** *(new)* | `watchdog.py` | go2rtc's RTSP for the camera serves no video for `OWLET_WATCHDOG_STALL` (120 s) | `SIGTERM` **only that camera's** `tutk_client` (its handler releases the camera session cleanly), kill any orphaned producer ffmpeg, and alias the camera's go2rtc stream to an unused spare so a wedged fan-out cannot keep it dead (no spare left → escalate); go2rtc relaunches the exec on the next consumer connect — the watchdog's own next probe is a consumer. go2rtc, the UI and other cameras stay up. Repeated `OWLET_WATCHDOG_PRODUCER_RESTARTS` (2) times, 120 s apart. | ~2–4 min |
-| **2 · container watchdog, stage 2** | `watchdog.py` | still dead after the stage‑1 attempts | kill go2rtc (PID 1) → Docker restarts the container (fresh login, fresh go2rtc). **Rate‑limited:** at most once per `OWLET_WATCHDOG_COOLDOWN` (300 s), doubling per consecutive restart up to `OWLET_WATCHDOG_COOLDOWN_MAX` (1800 s); the counter resets after `OWLET_WATCHDOG_HEALTHY_RESET` (900 s) of every camera healthy. While on cooldown the watchdog keeps doing stage 1. | ≥ 6 min |
+| **2 · container watchdog, stage 2** | `watchdog.py` | still dead after the stage‑1 attempts | kill go2rtc (PID 1) → Docker restarts the container (fresh go2rtc; streams restart on the saved camera key, not a fresh login). **Rate‑limited:** at most once per `OWLET_WATCHDOG_COOLDOWN` (300 s), doubling per consecutive restart up to `OWLET_WATCHDOG_COOLDOWN_MAX` (1800 s); the counter resets after `OWLET_WATCHDOG_HEALTHY_RESET` (900 s) of every camera healthy. While on cooldown the watchdog keeps doing stage 1. | ≥ 6 min |
 
 The stage‑1 delay (120 s) is deliberately longer than a full layer‑1 cycle
 (30 s detect + 8 s unblock + relaunch + the camera's 20 s slot hold + 25 s
 reconnect wait ≈ 90 s) so the watchdog never pre‑empts a recovery that is already
 in flight. TOT‑33's 45 s did exactly that.
+
+Layer 1 (the in‑process stall supervisor) is always on. Layer 2 (the container
+watchdog, both stages) is **off by default** (`OWLET_WATCHDOG=0`) until it has
+been validated on your hardware; set `OWLET_WATCHDOG=1` to enable it.
+
+## Camera key and cloud logins
+
+None of the layers above logs in to the Owlet cloud on its own. Every
+reconnect and relaunch uses the **saved** camera key (UID / AuthKey / AV
+password in the config). A cloud key refresh (one Firebase password login +
+KMS fetch, then the new key is saved) happens only when all of these hold:
+
+* `OWLET_REFRESH_KMS=1` (the default `0` never logs in automatically; refresh
+  the key with **Connect / refresh key** in the control panel instead);
+* the stream start has no saved UID, or a connect / AV‑login failure that a
+  rotated key could explain;
+* this stream start has not already used its one login;
+* the account‑wide login guard allows it: a persistent exponential backoff of
+  `OWLET_LOGIN_BACKOFF` (60 s) doubling per attempt up to
+  `OWLET_LOGIN_BACKOFF_MAX` (21600 s = 6 h), and a hard cap of
+  `OWLET_LOGIN_MAX_ATTEMPTS` (5) attempts without a session that delivers
+  video. The state lives in `/config/secrets/login-guard.json`, so it survives
+  stream relaunches and container restarts; after the cap, automatic logins
+  stop until a manual *Connect / refresh key* (or a session that delivers
+  video) re‑arms them.
 
 ## Where to look
 
