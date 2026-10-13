@@ -130,9 +130,28 @@ class StopAllProducersTests(unittest.TestCase):
                 mock.patch.object(wd, "_gone", lambda pids, t: False):
             got = wd.stop_all_producers(names=["owlet"], timeout=0)
         self.assertEqual(got, [100, 101, 102])
-        self.assertEqual(sent[0], ([100], signal.SIGTERM))
-        self.assertEqual(sent[1], ([101, 102], signal.SIGTERM))
-        self.assertEqual(sent[2], ([100, 101, 102], signal.SIGKILL))
+        # SIGTERM to the wrapper ONLY (it forwards one to tutk_client + ffmpeg);
+        # the children are only SIGKILLed if they outlive the timeout
+        self.assertEqual(sent, [([100], signal.SIGTERM),
+                                ([100, 101, 102], signal.SIGKILL)])
+
+    def test_children_never_get_a_second_sigterm(self):
+        procs = [
+            (100, 1, self._wrapper_cmd("a")),
+            (101, 100, "python3 /app/tutk_client.py"),
+            (102, 100, "ffmpeg -f h264 -i - -f rtsp rtsp://127.0.0.1:8554/a"),
+            (110, 1, self._wrapper_cmd("b")),
+            (111, 110, "python3 /app/tutk_client.py"),
+        ]
+        got, sent = self._stop(procs, names=["a", "b"])
+        self.assertEqual(got, [100, 101, 102, 110, 111])
+        self.assertEqual(sent, [([100, 110], signal.SIGTERM)])
+
+    def test_orphaned_tutk_client_without_wrapper_is_signalled_directly(self):
+        procs = [(800, 1, "python3 /app/tutk_client.py")]
+        got, sent = self._stop(procs, names=[])
+        self.assertEqual(got, [800])
+        self.assertEqual(sent, [([800], signal.SIGTERM)])
 
     def test_nothing_running(self):
         with mock.patch.object(wd, "_procs", lambda: []):
@@ -199,6 +218,39 @@ class StopAllProducersTests(unittest.TestCase):
                 mock.patch.object(wd, "_kill", lambda pids, sig: sent.append(sorted(pids))), \
                 mock.patch.object(wd, "_gone", lambda pids, t: True):
             self.assertEqual(wd.stop_all_producers(names=[], timeout=0), [700, 701])
+
+
+class TutkSigtermHandlerTests(unittest.TestCase):
+    def setUp(self):
+        import tutk_client as tc
+        self.tc = tc
+        self.logs = []
+        for p in (mock.patch.dict(tc._SHUTTING_DOWN, {"flag": False, "logged": False}),
+                  mock.patch.object(tc, "log", lambda *a: self.logs.append(a))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_second_sigterm_does_not_interrupt_teardown(self):
+        exits = 0
+        for _ in range(3):
+            try:
+                self.tc._on_sigterm(signal.SIGTERM, None)
+            except SystemExit as e:
+                self.assertEqual(e.code, 0)
+                exits += 1
+        self.assertEqual(exits, 1, "exactly one SystemExit, later SIGTERMs ignored")
+        self.assertTrue(self.tc._SHUTTING_DOWN["flag"])
+        self.assertEqual(len(self.logs), 1, "the ignored repeat is logged once")
+
+    def test_main_installs_the_idempotent_handler(self):
+        installed = {}
+        with mock.patch.object(signal, "signal",
+                               lambda s, h: installed.__setitem__(s, h)), \
+                mock.patch.object(self.tc, "resolve_creds",
+                                  side_effect=RuntimeError("stop")):
+            with self.assertRaises(RuntimeError):
+                self.tc.main()
+        self.assertIs(installed[signal.SIGTERM], self.tc._on_sigterm)
 
 
 class WatchdogDefaultTests(unittest.TestCase):

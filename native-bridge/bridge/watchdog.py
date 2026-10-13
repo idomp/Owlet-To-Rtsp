@@ -325,8 +325,9 @@ def stop_all_producers(names=None, timeout: float = 10.0, extra_names=()) -> lis
     ffmpeg) BEFORE go2rtc is restarted. go2rtc's /api/restart re-execs itself
     in place without stopping its exec sources, so their children used to be
     left running, still holding each camera's single P2P slot. SIGTERM the
-    wrappers (their trap forwards it to tutk_client + ffmpeg), then SIGKILL
-    anything still alive after `timeout`. Returns the PIDs that were targeted.
+    wrappers only (their trap forwards it to tutk_client + ffmpeg), then
+    SIGKILL anything still alive after `timeout`. Returns the PIDs that were
+    targeted.
 
     Wrappers are found by their marker in the process table, NOT only by the
     camera names in the config: the web UI saves a rename/delete before it
@@ -350,11 +351,18 @@ def stop_all_producers(names=None, timeout: float = 10.0, extra_names=()) -> lis
         _py, _others, wr = producer_pids(n, procs)
         wrappers.update(wr)
     kids = {p for p, pp, _c in procs if pp in wrappers}
-    allp = sorted(wrappers | kids)
+    # A tutk_client whose wrapper is already gone (reparented to PID 1) has
+    # nobody to forward the SIGTERM, so it is signalled directly.
+    orphans = {p for p, pp, c in procs
+               if pp == 1 and p != me and "tutk_client.py" in c
+               and os.path.basename((c.split() or [""])[0]).startswith("python")}
+    allp = sorted(wrappers | kids | orphans)
     if not allp:
         return []
-    _kill(sorted(wrappers), signal.SIGTERM)
-    _kill(sorted(kids), signal.SIGTERM)
+    # SIGTERM goes to the wrappers ONLY: their trap forwards exactly one
+    # SIGTERM to tutk_client + ffmpeg. Signalling the children as well used to
+    # deliver a second SIGTERM into tutk_client's session teardown.
+    _kill(sorted(wrappers | orphans), signal.SIGTERM)
     if not _gone(allp, timeout):
         _kill(allp, signal.SIGKILL)
         _gone(allp, 2)

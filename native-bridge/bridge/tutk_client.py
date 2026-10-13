@@ -1730,12 +1730,29 @@ def _persist_key(creds: dict) -> None:
         log(f"could not persist the refreshed key: {e}")
 
 
+_SHUTTING_DOWN = {"flag": False, "logged": False}
+
+
+def _on_sigterm(*_a) -> None:
+    """First SIGTERM: mark shutting down and raise SystemExit so stream_once()'s
+    finally releases the camera session cleanly. Any later SIGTERM is ignored
+    (logged once): raising again would interrupt that very teardown and leave
+    the camera holding a dead session for ~20 s."""
+    if _SHUTTING_DOWN["flag"]:
+        if not _SHUTTING_DOWN["logged"]:
+            _SHUTTING_DOWN["logged"] = True
+            log("SIGTERM again during shutdown — ignored, session teardown continues")
+        return
+    _SHUTTING_DOWN["flag"] = True
+    sys.exit(0)
+
+
 def main() -> None:
     # On SIGTERM (go2rtc stopping the source / container shutdown) raise SystemExit
     # so stream_once()'s finally releases the camera session cleanly — otherwise the
     # cam holds the single P2P slot and the next connect is refused.
     import signal
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGTERM, _on_sigterm)
     # Saved key first; log in at start only if there is no saved UID at all.
     uid = resolve_creds(refresh=not UID)
     last_kms = time.monotonic()
