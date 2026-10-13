@@ -341,17 +341,29 @@ class NonAsciiCredentialTests(WebappTestBase):
         self.assertFalse(webapp._creds_match("", "", self.N_USER, self.N_PASS))
         self.assertTrue(webapp._creds_match(USER, PASS, USER, PASS))
 
-    def test_non_ascii_saved_password_never_turns_logins_into_500(self):
+    def _basic(self, u, p):
+        tok = base64.b64encode(f"{u}:{p}".encode("utf-8")).decode()
+        return {"Authorization": f"Basic {tok}"}
+
+    def test_non_ascii_env_password_logs_in(self):
         with mock.patch.object(webapp, "UI_USER", self.N_USER), \
              mock.patch.object(webapp, "UI_PASS", self.N_PASS):
-            good = base64.b64encode(f"{self.N_USER}:{self.N_PASS}".encode("utf-8")).decode()
-            r = self.c.get("/api/status", headers={"Authorization": f"Basic {good}"})
-            # the framework's header decoding decides whether non-ASCII
-            # credentials can match at all; what must never happen is a 500
-            self.assertIn(r.status_code, (200, 401), r.status_code)
-            bad = base64.b64encode(f"{self.N_USER}:nope".encode("utf-8")).decode()
-            r = self.c.get("/api/status", headers={"Authorization": f"Basic {bad}"})
+            r = self.c.get("/api/status", headers=self._basic(self.N_USER, self.N_PASS))
+            self.assertEqual(r.status_code, 200)
+            r = self.c.get("/api/status", headers=self._basic(self.N_USER, "nope"))
             self.assertEqual(r.status_code, 401)
+
+    def test_non_ascii_saved_password_logs_in(self):
+        # the path the reviewer named: credentials saved in the config, not env
+        with mock.patch.object(webapp, "UI_USER", ""), mock.patch.object(webapp, "UI_PASS", ""):
+            cs.save_config(dict(cs.load_config(), ui_user=self.N_USER, ui_pass=self.N_PASS),
+                           regenerate=False)
+            self.assertEqual(webapp._ui_creds(), (self.N_USER, self.N_PASS))
+            r = self.c.get("/api/status", headers=self._basic(self.N_USER, self.N_PASS))
+            self.assertEqual(r.status_code, 200)
+            r = self.c.get("/api/status", headers=self._basic(self.N_USER, "nope"))
+            self.assertEqual(r.status_code, 401)
+            self.assertEqual(self.c.get("/api/status").status_code, 401)
 
 
 if __name__ == "__main__":

@@ -173,10 +173,12 @@ def _auth():
 
 
 def _creds_match(given_user: str, given_pw: str, user: str, pw: str) -> bool:
-    """Constant-time credential check. hmac.compare_digest() raises TypeError
-    for str arguments outside ASCII, which turned a saved non-ASCII password
-    into a 500 on every login; comparing the UTF-8 bytes keeps the timing
-    guarantee for any password."""
+    """Credential check through hmac.compare_digest(), which raises TypeError
+    for str arguments outside ASCII and turned a saved non-ASCII password into
+    a 500 on every login; the UTF-8 bytes are compared instead. compare_digest
+    only hides WHICH bytes differ between equal-length inputs; the encoding
+    step and the username-then-password order are not timing-neutral, as
+    upstream's version was not either."""
     return hmac.compare_digest(given_user.encode("utf-8"), user.encode("utf-8")) \
         and hmac.compare_digest(given_pw.encode("utf-8"), pw.encode("utf-8"))
 
