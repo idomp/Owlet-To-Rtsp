@@ -3,10 +3,12 @@ paho is replaced by a fake module, no broker is contacted.
 
 Run:  python3 -m unittest discover -s native-bridge/bridge/tests -v
 """
+import collections.abc
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -18,6 +20,21 @@ import tutk_client as tc  # noqa: E402
 import vitals_poller as vp  # noqa: E402
 
 
+class FakeInfo:
+    """paho's MQTTMessageInfo: rc, mid and is_published(), which turns true
+    once the broker acknowledged the message (a QoS 0 message counts as
+    published once written). Tests flip it through FakeClient.ack()."""
+
+    def __init__(self, mid, topic, qos):
+        self.rc = 0
+        self.mid = mid
+        self.topic = topic
+        self.published = not qos
+
+    def is_published(self):
+        return self.published
+
+
 class FakeClient:
     def __init__(self, *a, **k):
         self.pubs = []
@@ -25,7 +42,7 @@ class FakeClient:
         self.on_publish = None
         self.will = None
         self._next_mid = 0
-        self.inflight = []      # (mid, topic) of QoS 1 publishes not yet acknowledged
+        self.inflight = []      # FakeInfo of QoS 1 publishes not yet acknowledged
 
     def username_pw_set(self, u, p):
         pass
@@ -47,13 +64,16 @@ class FakeClient:
 
     def publish(self, topic, payload=None, qos=0, retain=False):
         """paho's signature: qos and retain may come as keywords in any order.
-        Returns an MQTTMessageInfo-like object with rc and mid."""
+        Returns an MQTTMessageInfo-like object (FakeInfo)."""
         self.pubs.append((topic, payload, retain))
         self.qos.append((topic, qos))
         self._next_mid += 1
+        info = FakeInfo(self._next_mid, topic, qos)
         if qos:
-            self.inflight.append((self._next_mid, topic))
-        return types.SimpleNamespace(rc=0, mid=self._next_mid)
+            self.inflight.append(info)
+        elif self.on_publish:                  # paho reports QoS 0 sends too
+            self.on_publish(self, None, info.mid)
+        return info
 
     @property
     def qos(self):
@@ -64,13 +84,13 @@ class FakeClient:
         return [t for t, _p, _r in self.pubs]
 
     def ack(self, topics=None):
-        """Simulate the broker's PUBACK: paho calls on_publish(client,
-        userdata, mid) for every acknowledged QoS 1 message (all in flight, or
-        only those on `topics`)."""
-        done = [(m, t) for m, t in self.inflight if topics is None or t in topics]
-        self.inflight = [x for x in self.inflight if x not in done]
-        for mid, _t in done:
-            self.on_publish(self, None, mid)
+        """Simulate the broker's PUBACK: paho marks the MQTTMessageInfo of
+        every acknowledged QoS 1 message published (all in flight, or only
+        those on `topics`)."""
+        done = [i for i in self.inflight if topics is None or i.topic in topics]
+        self.inflight = [i for i in self.inflight if i not in done]
+        for info in done:
+            info.published = True
 
 
 class SyncConnectClient(FakeClient):
@@ -352,12 +372,48 @@ class DiscoveryRecordTests(unittest.TestCase):
         m.set_active_sources({"cam"})
         self.assertEqual(self.recorded(), {})
 
-    def test_on_publish_callback_does_not_take_the_lock(self):
+    def test_puback_while_the_lock_is_held_does_not_block(self):
+        self.write_record({self.SOCK_CFG: self.sock_entry()})
         m, c = self.mqtt()
-        self.assertIsNotNone(c.on_publish, "must register an on_publish handler")
-        with m._lock:                          # a publisher holds the lock ...
-            c.on_publish(c, None, 42)          # ... the PUBACK must not wait for it
-        self.assertIn(42, m._acks)
+        self.assertIsNone(c.on_publish, "no publish callback is registered")
+        m.set_active_sources({"cam"})
+        c.on_connect(c, None, {}, 0)
+        # the network thread acknowledges while a publisher holds the lock
+        with m._lock:
+            t = threading.Thread(target=c.ack, daemon=True)
+            t.start()
+            t.join(timeout=5)
+            self.assertFalse(t.is_alive(), "the PUBACK waited for the publisher lock")
+        m.set_active_sources({"cam"})          # next pass sees the acknowledgement
+        self.assertEqual(self.recorded(), {})
+
+    def test_ordinary_publishes_leave_no_per_message_state(self):
+        m, c = self.mqtt()
+        m.set_active_sources({"cam"})
+        c.on_connect(c, None, {}, 0)
+        for i in range(5000):                  # QoS 0 state, nothing to retire
+            m.publish_device(dict(self.cam(), sensors={"temperature": 20 + i % 7}))
+            m.set_active_sources({"cam"})
+        self.assertGreater(len(c.pubs), 4000)
+        for name, value in vars(m).items():
+            if isinstance(value, collections.abc.Collection) and not isinstance(value, str):
+                self.assertLess(len(value), 50, f"_Mqtt.{name} grows with every publish")
+
+    def test_unacknowledged_resends_keep_a_bounded_number_of_handles(self):
+        self.write_record({self.SOCK_CFG: self.sock_entry()})
+        m, c = self.mqtt()
+        m.set_active_sources({"cam"})
+        for _ in range(50):                    # reconnects re-send every time
+            c.on_connect(c, None, {}, 0)
+        track = m._retire_msgs[self.SOCK_CFG]
+        self.assertEqual(set(track), {self.SOCK_CFG, "owlet/sock1/state",
+                                      "owlet/sock1/availability"})
+        for infos in track.values():
+            self.assertLessEqual(len(infos), vp.RETIRE_INFLIGHT_KEEP)
+        c.ack()
+        m.set_active_sources({"cam"})
+        self.assertEqual(self.recorded(), {})
+        self.assertEqual(m._retire_msgs, {})
 
     def test_unconfirmed_entry_older_than_seven_days_is_pruned_with_a_warning(self):
         old = time.time() - vp.RETIRE_KEEP - 60

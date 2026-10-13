@@ -24,7 +24,6 @@ Two independent sources:
 
 from __future__ import annotations
 
-import collections
 import json
 import os
 import threading
@@ -45,6 +44,9 @@ RETIRE_KEEP = 7 * 24 * 3600
 # While polling, an unacknowledged retirement is re-sent at most this often
 # (every broker connect re-sends it as well).
 RETIRE_RESEND = 10 * 60
+# Per retirement message, how many unacknowledged sends are kept for their
+# acknowledgement (older ones are forgotten; any newer send proves as much).
+RETIRE_INFLIGHT_KEEP = 4
 
 
 def _retired_at(entry: dict):
@@ -121,12 +123,12 @@ class _Mqtt:
         self._record: dict[str, dict] = self._load_record()
         self._active: set[str] | None = None   # sources publishing this run
         self._connected = False
-        # Delivery evidence for retirement messages. _on_publish (paho's
-        # network thread) only appends the acknowledged mid to _acks; the
-        # rest is applied under self._lock by _apply_acks_locked.
-        self._acks: collections.deque = collections.deque()
-        self._mid_topic: dict[int, str] = {}   # retirement mid -> its topic
-        self._acked_topics: set[str] = set()   # retirement topics with a PUBACK
+        # Delivery evidence for retirement messages, kept only for retired,
+        # unconfirmed entries: config topic -> {message topic: True once the
+        # broker acknowledged it, else the MQTTMessageInfo objects of its
+        # sends still in flight (newest RETIRE_INFLIGHT_KEEP)}. Polled under
+        # self._lock by _apply_acks_locked; no publish callback is used.
+        self._retire_msgs: dict[str, dict[str, object]] = {}
         self._sent_at: dict[str, float] = {}   # config topic -> last retirement send
 
     # -- discovery record + retirement -------------------------------------- #
@@ -150,6 +152,7 @@ class _Mqtt:
         for t in [t for t, e in self._record.items() if e.get("confirmed_at") is not None]:
             del self._record[t]
             self._sent_at.pop(t, None)
+            self._retire_msgs.pop(t, None)
         try:
             os.makedirs(os.path.dirname(self.record_path) or ".", mode=0o700, exist_ok=True)
             cs._atomic_write(self.record_path,  # noqa: SLF001
@@ -197,27 +200,49 @@ class _Mqtt:
         return [(x, p) for x, p in ((e.get("state"), ""), (e.get("availability"), "offline"))
                 if x and x not in live]
 
+    @staticmethod
+    def _published(info) -> bool:
+        """MQTTMessageInfo.is_published(): for QoS 1 true once the broker's
+        PUBACK arrived. paho raises for an info whose publish failed; that is
+        no evidence of delivery."""
+        try:
+            return bool(info.is_published())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _track_send_locked(self, topic: str, msgs: dict[str, object]) -> None:
+        """Remember the MessageInfo objects of one retirement send of entry
+        `topic` ({message topic: info}). Caller holds the lock."""
+        track = self._retire_msgs.setdefault(topic, {})
+        for x, info in msgs.items():
+            have = track.get(x)
+            if have is True:
+                continue                       # already acknowledged
+            infos = (have or []) + [info]
+            track[x] = infos[-RETIRE_INFLIGHT_KEEP:]
+
     def _apply_acks_locked(self, now: float) -> bool:
-        """Turn the PUBACKs queued by _on_publish into delivery evidence and
+        """Check the in-flight retirement publishes for acknowledgements and
         mark every retired entry whose retirement messages have ALL been
         acknowledged "confirmed_at" (dropped on the next record write).
         Caller holds the lock. Returns True if an entry was confirmed."""
-        while True:
-            try:
-                mid = self._acks.popleft()
-            except IndexError:
-                break
-            topic = self._mid_topic.pop(mid, None)
-            if topic is not None:
-                self._acked_topics.add(topic)
         live = self._live_topics_locked()
         confirmed = 0
+        for topic in list(self._retire_msgs):
+            e = self._record.get(topic)
+            if e is None or _retired_at(e) is None or e.get("confirmed_at") is not None:
+                del self._retire_msgs[topic]   # gone, re-published or confirmed
         for topic, e in list(self._record.items()):
             if _retired_at(e) is None or e.get("confirmed_at") is not None:
                 continue
+            track = self._retire_msgs.get(topic, {})
+            for x, infos in list(track.items()):
+                if infos is not True and any(self._published(i) for i in infos):
+                    track[x] = True
             need = {topic} | {x for x, _p in self._retire_extras(e, live)}
-            if need <= self._acked_topics:
+            if all(track.get(x) is True for x in need):
                 self._record[topic] = dict(e, confirmed_at=now)
+                self._retire_msgs.pop(topic, None)
                 confirmed += 1
         if confirmed:
             self.log(f"[vitals] broker acknowledged the retirement of {confirmed} MQTT "
@@ -234,7 +259,8 @@ class _Mqtt:
         network thread from _on_connect). Once all three are accepted the
         entry is marked "retired_at"; it is "confirmed_at" (and dropped from
         the record) only when the broker has acknowledged every one of them
-        (PUBACK, seen through _on_publish). Until then it is re-sent on every
+        (PUBACK, seen through the kept MQTTMessageInfo.is_published() at the
+        start of a later pass). Until then it is re-sent on every
         connect (resend=True) and, during polling (resend=False), at most once
         per RETIRE_RESEND. An entry still unconfirmed after RETIRE_KEEP (7
         days) is pruned with a warning naming its topic. An entry with any of
@@ -253,6 +279,7 @@ class _Mqtt:
             for t in expired:
                 del self._record[t]
                 self._sent_at.pop(t, None)
+                self._retire_msgs.pop(t, None)
             dirty = dirty or bool(expired)
             if self.c is not None and self._connected:
                 live = self._live_topics_locked()
@@ -263,24 +290,29 @@ class _Mqtt:
                         and e.get("confirmed_at") is None
                         and (resend or _retired_at(e) is None
                              or now - self._sent_at.get(t, 0.0) >= RETIRE_RESEND)}
-                sent: dict[str, bool] = {}
+                sent: dict[str, object] = {}   # extra topic -> info (None: refused)
                 for topic, e in sorted(gone.items()):
-                    ok = self._try_pub(topic, "")
-                    extras = self._retire_extras(e, live)
-                    for extra, payload in extras:
+                    info = self._try_pub(topic, "")
+                    ok = info is not None
+                    msgs = {topic: info} if ok else {}
+                    for extra, payload in self._retire_extras(e, live):
                         if extra not in sent:
                             sent[extra] = self._try_pub(extra, payload)
                             self._avail.pop(extra, None)
                             self._last_state.pop(extra, None)
-                        ok = ok and sent[extra]
+                        if sent[extra] is None:
+                            ok = False
+                        else:
+                            msgs[extra] = sent[extra]
                     if _retired_at(e) is not None:
                         self._sent_at[topic] = now     # re-send of a marked entry
+                        self._track_send_locked(topic, msgs)
                         continue
                     if not ok:
                         continue                       # refused -> stays unmarked, retried
-                    # acknowledgements older than this pass prove nothing
-                    # about it (the queued PUBACKs of this pass come later)
-                    self._acked_topics.difference_update({topic} | {x for x, _p in extras})
+                    # a fresh marking: only this send (and later ones) counts
+                    self._retire_msgs.pop(topic, None)
+                    self._track_send_locked(topic, msgs)
                     self._record[topic] = dict(e, retired_at=now)
                     self._sent_at[topic] = now
                     self._discovery.pop(topic, None)
@@ -301,33 +333,17 @@ class _Mqtt:
                      "until the broker acknowledges it)")
         return newly
 
-    def _try_pub(self, topic: str, payload: str) -> bool:
-        """QoS 1 retained publish, not waited on; False if paho refused it.
-        Caller holds the lock. The message id is remembered so its PUBACK
-        (_on_publish) can be matched to the topic; a newer send on the same
-        topic replaces the older id."""
+    def _try_pub(self, topic: str, payload: str):
+        """QoS 1 retained publish, not waited on. Returns paho's
+        MQTTMessageInfo (its is_published() turns true on the PUBACK), or
+        None if paho refused the publish. Caller holds the lock."""
         try:
             info = self.c.publish(topic, payload, qos=1, retain=True)
         except Exception:  # noqa: BLE001
-            return False
-        rc = getattr(info, "rc", 0)
-        if rc:
-            return False
-        mid = getattr(info, "mid", None)
-        if isinstance(mid, int) and not isinstance(mid, bool):
-            for old in [m for m, t in self._mid_topic.items() if t == topic]:
-                del self._mid_topic[old]
-            self._mid_topic[mid] = topic
-        return True
-
-    def _on_publish(self, _client, _userdata, mid, *_a):
-        """paho callback (network thread) once a publish completes -- for QoS 1
-        that is the broker's PUBACK. It only queues the message id and never
-        takes self._lock: paho can hold its own message lock around this call
-        while another thread holds self._lock inside publish() waiting for
-        that same paho lock. The ids are matched on the next retirement pass
-        (every poll cycle while one is pending, and every connect)."""
-        self._acks.append(mid)
+            return None
+        if info is None or getattr(info, "rc", 0):
+            return None
+        return info
 
     def ensure(self, s: dict):
         """Connect/disconnect/reconnect to match settings dict `s`. Retries each
@@ -347,11 +363,9 @@ class _Mqtt:
                 self._discovery.clear()
                 self._avail.clear()
                 self._last_state.clear()
-                # message ids and acknowledgements belong to the old client
-                # (and possibly another broker)
-                self._acks.clear()
-                self._mid_topic.clear()
-                self._acked_topics.clear()
+                # in-flight publishes and acknowledgements belong to the old
+                # client (and possibly another broker)
+                self._retire_msgs.clear()
             self._key = key
         if not s.get("enabled") or not s.get("host"):
             return
@@ -372,7 +386,6 @@ class _Mqtt:
             c.will_set(f"{STATE_PREFIX}/bridge/status", "offline", retain=True)
             c.on_connect = self._on_connect
             c.on_disconnect = self._on_disconnect
-            c.on_publish = self._on_publish
             c.connect(s["host"], int(s.get("port") or 1883), 60)
             # Assigned BEFORE the network loop starts: a fast CONNACK runs
             # _on_connect on paho's thread, and its retirement pass needs

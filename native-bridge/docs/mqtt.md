@@ -83,8 +83,13 @@ The three retirement messages are published with QoS 1 and retained, without
 waiting for the broker (they are also sent from the MQTT network callback,
 which must not block). An accepted publish is not yet proof of delivery — a
 disconnect or a crash can lose it before it leaves the socket — so the bridge
-keeps each message's id and waits for the broker's acknowledgement (the QoS 1
-`PUBACK`, reported by the MQTT client's publish callback):
+keeps the delivery handle the MQTT client returns for each of these messages
+(paho's `MQTTMessageInfo`) and waits for the broker's acknowledgement (the QoS 1
+`PUBACK`, which marks the handle published). The handles are checked at the
+start of each retirement pass (every poll cycle while a retirement is pending,
+and every connect). Only retirement messages are tracked this way, at most the
+last few sends per message of an entry that is retired and not yet confirmed;
+the ordinary state, discovery and availability messages leave nothing behind.
 
 * once **all three** messages of an entry are acknowledged, the entry is
   confirmed and dropped from the record on the next write; it is never sent
