@@ -14,10 +14,12 @@ This keeps the state in one file shared by every stream process (flock'd):
   * the next one is allowed only after an exponential delay:
       OWLET_LOGIN_BACKOFF (60 s) * 2^(attempt-1), capped at
       OWLET_LOGIN_BACKOFF_MAX (21600 s = 6 h);
-  * after OWLET_LOGIN_MAX_ATTEMPTS (default 5) attempts without a session that
-    actually delivered video, automatic logins stop completely. The bridge keeps
-    connecting with the saved key; only a successful manual "Connect / refresh
-    key" in the control panel (or a session that delivers video) re-arms it.
+  * after OWLET_LOGIN_MAX_ATTEMPTS (default 5) attempts without a refreshed key
+    that actually delivered video, automatic logins stop completely. The bridge
+    keeps connecting with the saved key; only a successful manual "Connect /
+    refresh key" in the control panel (or video from a key that an automatic
+    refresh just fetched) re-arms it. Re-arming resets the attempt count only:
+    the pending interval since the last login still has to elapse.
 
 With the defaults a failure episode costs at most 5 logins, spread over
 60+120+240+480 s (~15 min), then none.
@@ -103,12 +105,20 @@ def try_acquire(now: float | None = None) -> tuple[bool, str]:
 
 
 def record_success() -> None:
-    """A session delivered video, or a manual key fetch worked: re-arm."""
+    """A refreshed key delivered video, or a manual key fetch worked: reset the
+    escalation (attempts -> 0, so the cap and the doubling start over).
+
+    `next_allowed` is left untouched: try_acquire() is the only place that
+    moves it, so after any automatic login the next one stays blocked for at
+    least BASE seconds whatever happens in between. Clearing it here let a
+    transient failure, a login and a saved-key session with video repeat as
+    fast as the camera reconnects."""
     try:
         with _locked():
             st = _load()
-            if st.get("attempts") or st.get("next_allowed"):
-                _save({"attempts": 0, "next_allowed": 0, "last_ok": time.time()})
+            if st.get("attempts"):
+                st.update(attempts=0, last_ok=time.time())
+                _save(st)
     except OSError:
         pass
 

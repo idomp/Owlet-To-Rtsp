@@ -1652,19 +1652,25 @@ _HAD_VIDEO = [False]           # this process has forwarded at least one frame
 _SESSION_VIDEO = [False]       # the current stream_once session has (reset by main)
 _SUCCESS_RECORDED = [False]    # record_success() done for this session (reset by main)
 _GUARD_ERR_LOGGED = [False]    # a record_success() failure was already logged
+_KEY_REFRESHED = [False]       # resolve_creds() fetched a NEW key (taken over by main)
+_SESSION_FRESH_KEY = [False]   # the current session uses that freshly fetched key
 
 
 def _on_first_frame() -> None:
-    """First forwarded frame of a session. The key evidently works, so re-arm
-    the account-wide login guard, once per SESSION: a long-lived process may
-    refresh a rotated key on a later connection attempt (each refresh counts
-    against the guard's cap), and the video that follows must re-arm it again,
-    or a few successful rotations would exhaust the cap for good. Called from
-    the frame loop, so it must never raise; a failure is logged once per
-    process."""
+    """First forwarded frame of a session. If this session runs on a key that
+    an automatic refresh fetched for this very connection attempt, that login
+    evidently worked, so reset the account-wide guard's escalation, once per
+    SESSION: a long-lived process may refresh a rotated key on a later
+    connection attempt (each refresh counts against the guard's cap), and the
+    video that follows must reset it again, or a few successful rotations
+    would exhaust the cap for good. Video from the key the process already
+    held says nothing about the cloud login (the failure that triggered it
+    was transient) and leaves the guard alone; so does another camera's video.
+    Called from the frame loop, so it must never raise; a failure is logged
+    once per process."""
     _SESSION_VIDEO[0] = True
     _HAD_VIDEO[0] = True
-    if _SUCCESS_RECORDED[0]:
+    if _SUCCESS_RECORDED[0] or not _SESSION_FRESH_KEY[0]:
         return
     _SUCCESS_RECORDED[0] = True
     try:
@@ -1720,6 +1726,7 @@ def resolve_creds(refresh: bool = True) -> str:
             api = OwletAPI(region, email, pw, log=lambda m: log(m))
             creds = api.camera_credentials(dsn)
             if creds.get("uid"):
+                held = (UID, AUTHKEY, AV_PASSWORD)
                 if creds.get("authkey"):
                     AUTHKEY = creds["authkey"]
                 if creds.get("av_password"):
@@ -1727,6 +1734,10 @@ def resolve_creds(refresh: bool = True) -> str:
                 log("refreshed camera key from KMS")
                 UID = creds["uid"]   # later fallbacks reuse the fresh key
                 _persist_key(creds)
+                # Only a key that differs from the one we held can make the
+                # next session's video evidence that this login was needed
+                # and worked; an identical key means the failure was transient.
+                _KEY_REFRESHED[0] = (UID, AUTHKEY, AV_PASSWORD) != held
                 return creds["uid"]
         except Exception as e:  # noqa: BLE001
             log(f"KMS refresh failed ({e}); falling back to the saved key")
@@ -1800,7 +1811,10 @@ def main() -> None:
         backoff = 5
         try:
             _SESSION_VIDEO[0] = False
-            _SUCCESS_RECORDED[0] = False   # each session re-arms the guard on video
+            _SUCCESS_RECORDED[0] = False   # at most one record_success per session
+            # A key fetched by the refresh of the previous attempt counts for
+            # this session only; any later session runs on a held key.
+            _SESSION_FRESH_KEY[0], _KEY_REFRESHED[0] = _KEY_REFRESHED[0], False
             rc = stream_once(uid, mode)
             if rc == 5:
                 # AV login failed for this security mode — advance to the next.
@@ -1816,9 +1830,10 @@ def main() -> None:
                     "release its session before reconnecting")
             elif rc != 0:
                 log(f"exit rc={rc}; retry in 5s")
-            # login_guard.record_success() already ran at this session's first
-            # forwarded frame (_on_first_frame), so a SIGTERM or broken pipe
-            # after video still re-arms the guard.
+            # If this session ran on a freshly fetched key,
+            # login_guard.record_success() already ran at its first forwarded
+            # frame (_on_first_frame), so a SIGTERM or broken pipe after video
+            # still resets the guard's escalation.
             #
             # At most one refresh per connection attempt, and only when that
             # attempt (made with the key we hold) produced no video AND failed

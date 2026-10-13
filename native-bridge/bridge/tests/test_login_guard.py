@@ -1,5 +1,6 @@
 """Login-storm brake: account-wide backoff + cap, one login per connection
-attempt (never after a session with video), record_success at first video,
+attempt (never after a session with video), record_success only at the first
+video of a freshly refreshed key (and never shortening the interval),
 OWLET_REFRESH_KMS=0, key persistence and OWLET_FORGET_ACCOUNT. Stdlib-only;
 the Owlet cloud client is faked, nothing touches the network.
 
@@ -76,6 +77,25 @@ class GuardTests(TmpConfig):
         lg.record_success()
         self.assertTrue(lg.try_acquire(now=10 ** 6)[0])
 
+    def test_success_resets_attempts_but_never_the_interval(self):
+        for t in (0, 10_000, 20_000):
+            self.assertTrue(lg.try_acquire(now=t)[0])
+        pending = lg.status()["next_allowed"]
+        self.assertEqual(pending, 20_000 + lg.delay_for(3))
+        lg.record_success()
+        self.assertEqual(lg.status()["attempts"], 0)
+        self.assertEqual(lg.status()["next_allowed"], pending)
+        self.assertFalse(lg.try_acquire(now=pending - 1)[0])
+        self.assertTrue(lg.try_acquire(now=pending)[0])
+        self.assertEqual(lg.status()["attempts"], 1)   # escalation starts over
+        self.assertEqual(lg.status()["next_allowed"], pending + lg.BASE)
+
+    def test_success_right_after_a_login_keeps_base_interval(self):
+        self.assertTrue(lg.try_acquire(now=1000)[0])
+        lg.record_success()
+        self.assertFalse(lg.try_acquire(now=1000 + lg.BASE - 1)[0])
+        self.assertTrue(lg.try_acquire(now=1000 + lg.BASE)[0])
+
     def test_state_is_shared_through_the_file(self):
         lg.try_acquire(now=1000)
         with open(lg.STATE_PATH) as fh:
@@ -108,10 +128,13 @@ class ResolveCredsTests(TmpConfig):
                   mock.patch.dict(os.environ, env),
                   mock.patch.object(tc, "UID", "OLDUID"),
                   mock.patch.object(tc, "AUTHKEY", "OLDKEY12"),
+                  mock.patch.object(tc, "AV_PASSWORD", tc.AV_PASSWORD),
                   mock.patch.object(tc, "_SUCCESS_RECORDED", [False]),
                   mock.patch.object(tc, "_SESSION_VIDEO", [False]),
                   mock.patch.object(tc, "_HAD_VIDEO", [False]),
                   mock.patch.object(tc, "_GUARD_ERR_LOGGED", [False]),
+                  mock.patch.object(tc, "_KEY_REFRESHED", [False]),
+                  mock.patch.object(tc, "_SESSION_FRESH_KEY", [False]),
                   mock.patch.object(tc, "log", lambda *a: None)):
             p.start()
             self.addCleanup(p.stop)
@@ -134,10 +157,29 @@ class ResolveCredsTests(TmpConfig):
         self.assertEqual(FakeAPI.calls, 1)              # reuses the fetched key
 
     def test_long_lived_process_can_refresh_again_once_guard_permits(self):
+        # record_success() no longer clears the pending interval, so let the
+        # backoff elapse instead (time is moved, the guard values are real)
         self.assertEqual(tc.resolve_creds(), "NEWUID")
-        lg.record_success()               # backoff elapsed / re-armed
-        tc.resolve_creds()
+        later = tc.time.time() + lg.delay_for(1) + 1
+        with mock.patch.object(tc.time, "time", lambda: later):
+            tc.resolve_creds()
         self.assertEqual(FakeAPI.calls, 2)  # no per-process lifetime cap
+
+    def test_only_a_changed_key_counts_as_refreshed(self):
+        tc.resolve_creds()                       # OLDUID -> NEWUID
+        self.assertTrue(tc._KEY_REFRESHED[0])
+        tc._KEY_REFRESHED[0] = False
+        later = tc.time.time() + lg.delay_for(1) + 1
+        with mock.patch.object(tc.time, "time", lambda: later):
+            self.assertEqual(tc.resolve_creds(), "NEWUID")   # same key again
+        self.assertEqual(FakeAPI.calls, 2)
+        self.assertFalse(tc._KEY_REFRESHED[0])
+
+    def test_failed_or_refused_refresh_is_not_a_refreshed_key(self):
+        lg.try_acquire()                         # guard in backoff
+        tc.resolve_creds()
+        self.assertEqual(FakeAPI.calls, 0)
+        self.assertFalse(tc._KEY_REFRESHED[0])
 
     def test_refresh_kms_0_is_honoured(self):
         with mock.patch.dict(os.environ, {"OWLET_REFRESH_KMS": "0"}):
@@ -230,12 +272,15 @@ class ScriptedAPI:
     in the scripted order."""
     script: list = []
     calls = 0
+    times: list = []            # (patched) wall-clock time of each login
+    clock = staticmethod(lambda: 0.0)
 
     def __init__(self, region, email, pw, log=None):
         pass
 
     def camera_credentials(self, dsn):
         ScriptedAPI.calls += 1
+        ScriptedAPI.times.append(ScriptedAPI.clock())
         outcome = ScriptedAPI.script.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -244,18 +289,27 @@ class ScriptedAPI:
 
 class ReconnectLifecycleTests(TmpConfig):
     """main()'s reconnect loop with the real resolve_creds(); stream_once,
-    the Owlet cloud client, login_guard and time are faked."""
+    the Owlet cloud client, login_guard and time are faked. One virtual clock
+    drives time.time() (the real guard's backoff), time.monotonic() and
+    time.sleep(); each session lasts `session_secs` of it."""
+
+    session_secs = 20
 
     def setUp(self):
         super().setUp()
+        self.now = [1_000_000.0]
         ScriptedAPI.calls = 0
         ScriptedAPI.script = []
+        ScriptedAPI.times = []
+        ScriptedAPI.clock = staticmethod(lambda: self.now[0])
         self.guard = FakeGuard()
         api_mod = types.ModuleType("owlet_api")
         api_mod.OwletAPI = ScriptedAPI
         env = {"OWLET_CAMERA_DSN": "OCD123", "OWLET_EMAIL": "user@example.com",
                "OWLET_PASSWORD": "pw", "OWLET_CAMERA_NAME": "nursery"}
-        clock = itertools.count(0, 100)
+
+        def sleep(s):
+            self.now[0] += s
         self.uids = []
         self.logs = []
         for p in (mock.patch.dict(sys.modules, {"owlet_api": api_mod,
@@ -263,14 +317,19 @@ class ReconnectLifecycleTests(TmpConfig):
                   mock.patch.dict(os.environ, env),
                   mock.patch.object(tc, "UID", "OLDUID"),
                   mock.patch.object(tc, "AUTHKEY", "OLDKEY12"),
+                  mock.patch.object(tc, "AV_PASSWORD", tc.AV_PASSWORD),
                   mock.patch.object(tc, "AV_SECURITY_MODE", "2"),
+                  mock.patch.object(tc, "RECONNECT_WAIT", 25),
                   mock.patch.object(tc, "_SUCCESS_RECORDED", [False]),
                   mock.patch.object(tc, "_SESSION_VIDEO", [False]),
                   mock.patch.object(tc, "_HAD_VIDEO", [False]),
                   mock.patch.object(tc, "_GUARD_ERR_LOGGED", [False]),
+                  mock.patch.object(tc, "_KEY_REFRESHED", [False]),
+                  mock.patch.object(tc, "_SESSION_FRESH_KEY", [False]),
                   mock.patch.object(tc, "log", self.logs.append),
-                  mock.patch.object(tc.time, "sleep", lambda s: None),
-                  mock.patch.object(tc.time, "monotonic", lambda: next(clock)),
+                  mock.patch.object(tc.time, "sleep", sleep),
+                  mock.patch.object(tc.time, "monotonic", lambda: self.now[0]),
+                  mock.patch.object(tc.time, "time", lambda: self.now[0]),
                   mock.patch("signal.signal")):
             p.start()
             self.addCleanup(p.stop)
@@ -292,6 +351,7 @@ class ReconnectLifecycleTests(TmpConfig):
                 video, result = next(seq)
             except StopIteration:
                 raise SystemExit(0)
+            self.now[0] += self.session_secs
             if video:
                 for _ in range(3):        # the frame loop's guard: once per session
                     if not tc._SESSION_VIDEO[0]:
@@ -322,19 +382,54 @@ class ReconnectLifecycleTests(TmpConfig):
         self.assertEqual(self.guard.acquires, 0)
         self.assertTrue(any("previous session had video" in m for m in self.logs))
 
+    @staticmethod
+    def new_keys(n, start=0):
+        return [{"uid": f"UID{i}", "authkey": f"KEY{i:05d}"} for i in range(start, start + n)]
+
     def test_success_is_recorded_once_per_session(self):
-        # two sessions with video (the second ends in SIGTERM): one record each,
-        # however many frames each forwarded
-        self.run_main([(True, 6), (True, SystemExit(0))])
+        # two refreshed-key sessions with video (the second ends in SIGTERM):
+        # one record each, however many frames each forwarded. (Was two
+        # saved-key sessions; saved-key video no longer records anything.)
+        ScriptedAPI.script = self.new_keys(2)
+        self.run_main([(False, 4), (True, 6), (False, 4), (True, SystemExit(0))])
+        self.assertEqual(ScriptedAPI.calls, 2)
         self.assertEqual(self.guard.successes, 2)
 
+    def test_saved_key_video_records_nothing(self):
+        self.run_main([(True, 6), (True, 6), (True, SystemExit(0))])
+        self.assertEqual(self.guard.successes, 0)
+
+    def test_failed_refresh_then_saved_key_video_records_nothing(self):
+        ScriptedAPI.script = [RuntimeError("KMS HTTP 503"),
+                              {"uid": "OLDUID", "authkey": "OLDKEY12"}]  # same key
+        self.run_main([(False, 4), (True, 6), (False, 4), (True, 6)])
+        self.assertEqual(ScriptedAPI.calls, 2)
+        self.assertEqual(self.guard.successes, 0)
+
+    def test_fresh_key_counts_only_for_the_next_session(self):
+        # the refreshed key's first session fails; the video comes a session
+        # later (refresh refused by the guard): not this attempt's login
+        ScriptedAPI.script = self.new_keys(1)
+        self.guard.permits = [True, False]
+        self.run_main([(False, 4), (False, 4), (True, 6)])
+        self.assertEqual(self.uids, ["OLDUID", "UID0", "UID0", "UID0"])
+        self.assertEqual(self.guard.successes, 0)
+
     def test_success_is_recorded_once_within_a_session(self):
+        # adjusted: only a session on a freshly fetched key records at all
+        for _ in range(3):
+            tc._on_first_frame()
+        self.assertEqual(self.guard.successes, 0)
+        tc._SESSION_FRESH_KEY[0] = True
         for _ in range(3):
             tc._on_first_frame()
         self.assertEqual(self.guard.successes, 1)
 
     def _use_real_guard(self, max_attempts):
-        for obj, name, val in ((lg, "BASE", 0), (lg, "MAX_ATTEMPTS", max_attempts)):
+        # the real guard with its real intervals (BASE 60 s); only the cap is
+        # lowered where a test needs it, and time comes from the virtual clock
+        for obj, name, val in ((lg, "BASE", 60), (lg, "MAX_DELAY", 3600),
+                               (lg, "MAX_ATTEMPTS", max_attempts)):
             p = mock.patch.object(obj, name, val)
             p.start()
             self.addCleanup(p.stop)
@@ -342,47 +437,112 @@ class ReconnectLifecycleTests(TmpConfig):
         p.start()
         self.addCleanup(p.stop)
 
+    def login_gaps(self):
+        t = ScriptedAPI.times
+        return [b - a for a, b in zip(t, t[1:])]
+
     def test_successful_rotations_never_exhaust_the_cap(self):
         # one long-lived process: video, then the key rotates (connect fails),
         # a refresh fetches the new key and video flows again; repeated more
-        # often than the cap allows logins without video in between
+        # often than the cap allows logins without video in between. A round
+        # takes 20+5+20+25 = 70 s, past the real 60 s interval, so every
+        # rotation may refresh.
         cap = 3
         self._use_real_guard(cap)
         rounds = cap + 3
-        ScriptedAPI.script = [{"uid": f"UID{i}", "authkey": f"KEY{i:05d}"}
-                              for i in range(rounds)]
+        ScriptedAPI.script = self.new_keys(rounds)
         sessions = [(True, 6)]
         for _ in range(rounds):
             sessions += [(False, 4), (True, 6)]
         self.run_main(sessions)
         self.assertEqual(ScriptedAPI.calls, rounds)
+        self.assertTrue(all(g >= lg.BASE for g in self.login_gaps()))
         self.assertFalse(any("cap reached" in m for m in self.logs))
         self.assertEqual(lg.status()["attempts"], 0)
         self.assertEqual(self.uids[-1], f"UID{rounds - 1}")
 
     def test_refreshes_without_video_still_count_towards_the_cap(self):
+        # real intervals: 60 + 120 s must pass before the third login, so the
+        # run has more failed connects (25 s each) than before
         cap = 3
         self._use_real_guard(cap)
-        ScriptedAPI.script = [{"uid": f"UID{i}", "authkey": f"KEY{i:05d}"}
-                              for i in range(cap)]
-        self.run_main([(True, 6)] + [(False, 4)] * (cap + 3))
+        ScriptedAPI.script = self.new_keys(cap)
+        self.run_main([(True, 6)] + [(False, 4)] * 15)
         self.assertEqual(ScriptedAPI.calls, cap)
+        self.assertTrue(all(g >= lg.BASE for g in self.login_gaps()))
         self.assertTrue(any("cap reached" in m for m in self.logs))
         self.assertEqual(lg.status()["attempts"], cap)
 
+    def test_saved_key_video_cannot_lift_the_brake(self):
+        # the reported storm: transient connect failure -> login (failing,
+        # or returning the key we already hold) -> video with the saved key,
+        # every 10+5+10+25 = 50 s. Real BASE, real default cap of 5.
+        self._use_real_guard(5)
+        self.session_secs = 10
+        ScriptedAPI.script = [RuntimeError("KMS HTTP 503"),
+                              {"uid": "OLDUID", "authkey": "OLDKEY12"}] * 20
+        sessions = [(True, 6)]
+        for _ in range(30):                 # 1500 s, past 60+120+240+480 s
+            sessions += [(False, 4), (True, 6)]
+        self.run_main(sessions)
+        gaps = self.login_gaps()
+        self.assertTrue(gaps)
+        for n, gap in enumerate(gaps, start=1):
+            self.assertGreaterEqual(gap, lg.BASE)
+            self.assertGreaterEqual(gap, lg.delay_for(n))   # escalation kept
+        self.assertEqual(ScriptedAPI.calls, 5)              # cap still applies
+        self.assertTrue(any("cap reached" in m for m in self.logs))
+        self.assertEqual(lg.status()["attempts"], 5)
+        self.assertEqual(set(self.uids), {"OLDUID"})
+
+    def test_refreshed_key_video_resets_attempts_but_holds_the_interval(self):
+        self._use_real_guard(5)
+        lg.try_acquire(now=0)               # two earlier logins, long ago
+        lg.try_acquire(now=10_000)
+        ScriptedAPI.script = self.new_keys(1)
+        self.run_main([(True, 6), (False, 4), (True, 6)])
+        self.assertEqual(ScriptedAPI.calls, 1)
+        login = ScriptedAPI.times[0]
+        st = lg.status()
+        self.assertEqual(st["attempts"], 0)                       # escalation reset
+        self.assertEqual(st["next_allowed"], login + lg.delay_for(3))  # unchanged
+        self.assertGreaterEqual(st["next_allowed"], login + lg.BASE)
+        self.assertFalse(lg.try_acquire(now=login + lg.BASE - 1)[0])
+
+    def test_other_cameras_saved_key_video_keeps_an_exhausted_cap(self):
+        # camera A has used up the account-wide budget; camera B's process
+        # streams on its saved key. B's video says nothing about A's logins.
+        self._use_real_guard(5)
+        for i in range(5):
+            self.assertTrue(lg.try_acquire(now=i * 10_000)[0])
+        self.run_main([(True, 6), (True, 6), (True, SystemExit(0))])
+        self.assertEqual(len(self.uids), 3)
+        self.assertEqual(ScriptedAPI.calls, 0)
+        self.assertEqual(lg.status()["attempts"], 5)
+        ok, why = lg.try_acquire(now=10 ** 9)
+        self.assertFalse(ok)
+        self.assertIn("cap", why)
+
     def test_video_then_broken_pipe_records_success(self):
-        with mock.patch.object(tc, "stream_once",
-                               lambda uid, mode: (tc._on_first_frame(),
-                                                  (_ for _ in ()).throw(BrokenPipeError()))):
+        # adjusted: start without a saved key, so the session runs on the key
+        # the start-up refresh fetched (saved-key video records nothing)
+        ScriptedAPI.script = self.new_keys(1)
+        with mock.patch.object(tc, "UID", ""), \
+                mock.patch.object(tc, "stream_once",
+                                  lambda uid, mode: (tc._on_first_frame(),
+                                                     (_ for _ in ()).throw(BrokenPipeError()))):
             tc.main()                      # returns: exits for a clean go2rtc restart
+        self.assertEqual(ScriptedAPI.calls, 1)
         self.assertEqual(self.guard.successes, 1)
 
     def test_record_success_failure_is_swallowed_and_logged_once(self):
         def boom():
             raise RuntimeError("disk gone")
         self.guard.record_success = boom
+        ScriptedAPI.script = self.new_keys(2)
         with mock.patch.dict(sys.modules, {"login_guard": self.guard.module()}):
-            self.run_main([(True, 6), (True, 6)])
+            self.run_main([(False, 4), (True, 6), (False, 4), (True, 6)])
+        self.assertEqual(ScriptedAPI.calls, 2)
         self.assertEqual(sum("could not reset the login guard" in m for m in self.logs), 1)
 
     def test_refresh_kms_0_never_logs_in_across_reconnects(self):
