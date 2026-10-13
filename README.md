@@ -169,7 +169,7 @@ docker run -d --name owlet-bridge --restart unless-stopped --network owlet-net \
 
 **docker compose:** see [`native-bridge/bridge/docker-compose.yml`](native-bridge/bridge/docker-compose.yml).
 
-The control panel's RTSP copy URL uses the container's hostname and in‑container port, i.e. what another container on the same Docker network connects to. The WebRTC/HLS links only appear if you widen `GO2RTC_API_LISTEN`; `PUBLIC_HTTP_PORT` / `PUBLIC_WEBRTC_PORT` then tell the UI which host ports you published.
+By default the control panel's RTSP copy URL uses the container's hostname and the port go2rtc listens on (`GO2RTC_RTSP_LISTEN`), i.e. what another container on the same Docker network connects to. If you published RTSP on the host yourself, set `PUBLIC_RTSP_PORT` to the host port and the URL uses the host name you opened the panel with; `OWLET_ADVERTISE_RTSP=host:port` overrides both (see the variable table below). The WebRTC/HLS links only appear if you widen `GO2RTC_API_LISTEN`; `PUBLIC_HTTP_PORT` / `PUBLIC_WEBRTC_PORT` then tell the UI which host ports you published.
 
 ---
 
@@ -308,8 +308,9 @@ Everything's set in the web UI; these env vars override or tune it:
 | `OWLET_TALK` | `0` | `1` enables talk‑back and streamed sound playback into the nursery speaker (`/api/talk`, `/api/play`, sound uploads) |
 | `GO2RTC_USER` / `GO2RTC_PASS` | `owlet` / *(generated)* | credentials go2rtc requires on RTSP and its API for every non‑loopback client (`api.username`/`api.password`, `rtsp.username`/`rtsp.password`). Unset password = random one kept in `/config/secrets/go2rtc.json` (0600) |
 | `GO2RTC_API_LISTEN` | `127.0.0.1:1984` | go2rtc API bind address. Keep it on loopback; `:1984` only if you publish it deliberately |
-| `GO2RTC_RTSP_LISTEN` | `:8554` | RTSP bind address inside the container (reached by Frigate over the shared Docker network) |
-| `PUBLIC_RTSP_PORT` | `8554` | not used for the copy URL any more: the UI shows the in‑container RTSP port (`GO2RTC_RTSP_PORT`), which is what containers on the shared network connect to |
+| `GO2RTC_RTSP_LISTEN` | `:8554` | RTSP bind address inside the container (reached by Frigate over the shared Docker network). With neither variable below set, the control panel's RTSP copy URL is `rtsp://<GO2RTC_USER>:PASSWORD@<container hostname>:<this port>/<camera>` |
+| `PUBLIC_RTSP_PORT` | *(unset)* | set it only if you published RTSP on the Docker host (e.g. `-p 18554:8554`): the copy URL then uses the host name you opened the control panel with and this port, and the hint says "published on the host" |
+| `OWLET_ADVERTISE_RTSP` | *(unset)* | `host:port` to show in the RTSP copy URL, exactly as given (e.g. `nas.example:18554`, or `[2001:db8::5]:8554`). Wins over `PUBLIC_RTSP_PORT` and the listen port; use it when the panel's host name is not the one RTSP clients should use |
 | `OWLET_KEEPALIVE` | `1` | keep one camera session warm 24/7 (auto‑reconnect). **Leave on.** |
 | `OWLET_SESSION_CHECK` | `0` | experimental: log the TUTK session mode (P2P/relay) after each connect — crashed the stream process on the reference camera's lib build, keep off unless debugging |
 | `OWLET_STALL_TIMEOUT` | `30` | seconds without a video frame before the stream process unblocks/relaunches itself (see [Self‑healing](native-bridge/docs/self-heal.md)) |

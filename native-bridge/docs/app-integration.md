@@ -200,10 +200,18 @@ let the user assign in-app).
 ```
 GET https://<host>:8088/api/cameras
 ```
-returns each camera with its `name` and stream status, plus `rtsp_host`
-(the container's hostname), `rtsp_user`, `rtsp_port` and `api_published`
+returns each camera with its `name` and stream status, plus `rtsp_host`,
+`rtsp_user`, `rtsp_port`, `rtsp_published`, `rtsp_mode` and `api_published`
 (true only when `GO2RTC_API_LISTEN` is a non-loopback address). The RTSP
-password is never returned.
+endpoint follows the first that applies:
+
+| `rtsp_mode` | When | `rtsp_host` / `rtsp_port` | `rtsp_published` |
+|---|---|---|---|
+| `advertised` | `OWLET_ADVERTISE_RTSP=host:port` | exactly that host and port | `true` |
+| `published` | `PUBLIC_RTSP_PORT` set | the host name of your request / `PUBLIC_RTSP_PORT` | `true` |
+| `network` | neither | the container's hostname / go2rtc's RTSP listen port | `false` |
+
+The RTSP password is never returned.
 
 ---
 

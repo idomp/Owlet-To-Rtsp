@@ -59,7 +59,8 @@ TUTK_LIB_DIR = os.environ.get("TUTK_LIB_DIR", "/app/libs/x86_64")
 # ports; set these to the mapped host ports (e.g. 18554/1985/18555) when they're
 # remapped to coexist with Frigate, so the UI shows reachable URLs.
 PUBLIC_HTTP_PORT = os.environ.get("PUBLIC_HTTP_PORT", "1984")
-PUBLIC_RTSP_PORT = os.environ.get("PUBLIC_RTSP_PORT", "8554")
+# RTSP is different: PUBLIC_RTSP_PORT (and OWLET_ADVERTISE_RTSP) are read per
+# request in _stream_endpoints(), because "unset" means "not published".
 PUBLIC_WEBRTC_PORT = os.environ.get("PUBLIC_WEBRTC_PORT", "8555")
 
 # Web UI auth is ALWAYS on. Credentials, first match wins:
@@ -383,7 +384,8 @@ def list_cameras():
         "cameras": cams,
         "http_port": PUBLIC_HTTP_PORT,
         "webrtc_port": PUBLIC_WEBRTC_PORT,
-        # rtsp_host/rtsp_user/rtsp_port/api_published: see _stream_endpoints().
+        # rtsp_host/rtsp_user/rtsp_port/rtsp_published/rtsp_mode/api_published:
+        # see _stream_endpoints().
         **_stream_endpoints(),
     })
 
@@ -879,16 +881,68 @@ def _api_published() -> bool:
         return True                            # a hostname / interface name
 
 
+def _valid_port(v: str) -> bool:
+    return v.isdigit() and 0 < int(v) < 65536
+
+
+def _rtsp_listen_port() -> str:
+    """The port go2rtc's RTSP server actually listens on inside the container:
+    GO2RTC_RTSP_LISTEN (":8554", "0.0.0.0:9554", "[::]:8554") or, unset, the
+    GO2RTC_RTSP_PORT default that config_store renders."""
+    listen = (os.environ.get("GO2RTC_RTSP_LISTEN") or "").strip() or cs.G_RTSP_LISTEN
+    port = listen.rsplit(":", 1)[-1] if ":" in listen else listen
+    return port if _valid_port(port) else str(cs.G_RTSP)
+
+
+def _request_hostname() -> str:
+    """The host name the browser used to reach the panel (no port), with
+    IPv6 literals bracketed so the result can go straight into a URL."""
+    try:
+        host = urlparse("//" + request.host).hostname or ""
+    except ValueError:
+        host = ""
+    return f"[{host}]" if ":" in host else host
+
+
+def _rtsp_advertised():
+    """OWLET_ADVERTISE_RTSP="host:port" -> (host, port), else None."""
+    v = (os.environ.get("OWLET_ADVERTISE_RTSP") or "").strip()
+    if ":" not in v:
+        return None
+    host, port = v.rsplit(":", 1)
+    host = host.strip()
+    if not host or not _valid_port(port.strip()) or "/" in host or "@" in host:
+        return None
+    return host, port.strip()
+
+
 def _stream_endpoints() -> dict:
-    """What the UI needs to show a usable RTSP URL. RTSP is not published on
-    the Docker host by the shipped deployment files; other containers on the
-    same user-defined network reach it at this container's hostname on the
-    in-container port. The password is never returned (GO2RTC_PASS or
-    /config/secrets/go2rtc.json)."""
+    """What the UI needs to show a usable RTSP URL. First match wins:
+
+      1. OWLET_ADVERTISE_RTSP="host:port": exactly that (rtsp_mode "advertised").
+      2. PUBLIC_RTSP_PORT set: the operator published RTSP on the Docker host,
+         so the browser's host name with that port (rtsp_mode "published").
+      3. Otherwise RTSP is not published (the shipped deployment files don't):
+         other containers on the same user-defined network reach it at this
+         container's hostname on the port go2rtc listens on (rtsp_mode
+         "network").
+
+    rtsp_published is false only for 3. The password is never returned
+    (GO2RTC_PASS or /config/secrets/go2rtc.json)."""
+    adv = _rtsp_advertised()
+    public = (os.environ.get("PUBLIC_RTSP_PORT") or "").strip()
+    if adv:
+        (host, port), mode = adv, "advertised"
+    elif _valid_port(public):
+        host, port, mode = _request_hostname() or socket.gethostname(), public, "published"
+    else:
+        host, port, mode = socket.gethostname(), _rtsp_listen_port(), "network"
     return {
-        "rtsp_host": socket.gethostname(),
+        "rtsp_host": host,
         "rtsp_user": cs.go2rtc_credentials()[0],
-        "rtsp_port": str(cs.G_RTSP),
+        "rtsp_port": port,
+        "rtsp_published": mode != "network",
+        "rtsp_mode": mode,
         "api_published": _api_published(),
     }
 

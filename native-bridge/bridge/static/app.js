@@ -78,15 +78,24 @@ async function testLogin(btn) {
 }
 
 /* ---------- cameras ---------- */
-/* RTSP is reached from other containers on the same Docker network at this
-   container's hostname (it is not published on the Docker host). The go2rtc
-   API (WebRTC/HLS pages) is container-loopback unless GO2RTC_API_LISTEN
-   widens it, so those links are only offered when api_published is true.
+/* By default RTSP is reached from other containers on the same Docker network
+   at this container's hostname (rtsp_published false). With PUBLIC_RTSP_PORT
+   the operator published it on the Docker host, so the URL uses this page's
+   host name and that port; OWLET_ADVERTISE_RTSP pins host:port outright
+   (rtsp_mode "advertised"). The go2rtc API (WebRTC/HLS pages) is
+   container-loopback unless GO2RTC_API_LISTEN widens it, so those links are
+   only offered when api_published is true.
    These strings are always rendered with textContent, never innerHTML. */
-const RTSP_HINT = "PASSWORD = GO2RTC_PASS or the value in /config/secrets/go2rtc.json; "
-  + "reachable from containers on the same Docker network";
+const RTSP_PW_HINT = "PASSWORD = GO2RTC_PASS or the value in /config/secrets/go2rtc.json; ";
+function rtspHint(s){
+  if (s.rtsp_mode === "advertised") return RTSP_PW_HINT + "address set by OWLET_ADVERTISE_RTSP";
+  if (s.rtsp_published === true) return RTSP_PW_HINT + "published on the host (PUBLIC_RTSP_PORT)";
+  return RTSP_PW_HINT + "reachable from containers on the same Docker network";
+}
 function camUrls(name, s){
-  const rhost = s.rtsp_host || "<container-name>", rp = s.rtsp_port || "8554";
+  const rhost = (s.rtsp_mode === "published" ? location.hostname : "") || s.rtsp_host
+    || "<container-name>";
+  const rp = s.rtsp_port || "8554";
   const host = location.hostname, hp = s.http_port || "1984";
   const cred = s.rtsp_user ? `${s.rtsp_user}:PASSWORD@` : "";
   return {
@@ -143,7 +152,7 @@ function buildCard(cam, ports){
 
   // stream URLs as plain text (copy buttons copy the <code> textContent)
   el.querySelector(".u-rtsp").textContent = u.rtsp;
-  el.querySelector(".u-hint").textContent = RTSP_HINT;
+  el.querySelector(".u-hint").textContent = rtspHint(ports);
   el.querySelector(".u-web").textContent = u.web;
   el.querySelector(".u-hls").textContent = u.hls;
   if (ports.api_published !== true) {
