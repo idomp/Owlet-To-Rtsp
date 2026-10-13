@@ -300,11 +300,17 @@ def _write_config(cfg: dict, regenerate: bool = True) -> None:
     except OSError as e:
         raise ConfigWriteError(f"cannot write {CONFIG_PATH}: {e.strerror or e}") from e
     if regenerate:
-        try:
-            generate(account, cameras)
-        except OSError as e:
-            raise ConfigWriteError(f"config saved, but the generated stream files could "
-                                   f"not be written: {e.strerror or e}") from e
+        _regenerate(cfg)
+
+
+def _regenerate(cfg: dict) -> None:
+    """Rewrite the per-camera envs + go2rtc config from `cfg`. Cheap and
+    idempotent. Raises ConfigWriteError on failure."""
+    try:
+        generate(_account_of(cfg), _normalize_cameras(cfg.get("cameras")))
+    except OSError as e:
+        raise ConfigWriteError(f"config saved, but the generated stream files could "
+                               f"not be written: {e.strerror or e}") from e
 
 
 def save_config(cfg: dict, regenerate: bool = True) -> bool:
@@ -369,15 +375,19 @@ def config_transaction(regenerate: bool = True):
     Loads the config, yields the dict, and on a normal exit writes it back
     atomically (unique temp file + os.replace) and, if `regenerate`, rewrites
     the generated env/go2rtc files. If the body raises, nothing is written. If
-    the dict was not changed (and a config file already exists), nothing is
-    written either, so a lookup that ends in "no such camera" is free.
-    Write failures raise ConfigWriteError (an OSError)."""
+    the dict was not changed (and a config file already exists), the JSON is
+    not rewritten, but with `regenerate` the generated files still are: a
+    previous save may have committed the JSON and then failed to render them,
+    and re-submitting the same settings must repair that, not report success
+    over stale files. Write failures raise ConfigWriteError (an OSError)."""
     with _config_file_lock():
         cfg = load_config()
         before = copy.deepcopy(cfg)
         existed = os.path.exists(CONFIG_PATH)
         yield cfg
         if existed and cfg == before:
+            if regenerate:
+                _regenerate(cfg)
             return
         _write_config(cfg, regenerate=regenerate)
 

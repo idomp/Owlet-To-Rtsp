@@ -133,6 +133,30 @@ class TransactionTests(TmpConfig):
                 cs.find_camera(cfg, "nobody")
         w.assert_not_called()
 
+    def test_resubmitting_after_failed_render_regenerates(self):
+        env_path = os.path.join(cs.CAM_DIR, "nursery.env")
+
+        def submit():
+            with cs.config_transaction() as cfg:
+                cfg["email"] = "user@example.com"
+        with mock.patch.object(cs, "generate", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(cs.ConfigWriteError):
+                submit()
+        self.assertEqual(cs.load_config()["email"], "user@example.com")  # JSON committed
+        with open(env_path) as fh:
+            self.assertNotIn("user@example.com", fh.read())           # files stale
+        submit()                                   # same settings, cause fixed
+        with open(env_path) as fh:
+            self.assertIn("OWLET_EMAIL='user@example.com'", fh.read())
+
+    def test_unchanged_without_regenerate_renders_nothing(self):
+        with mock.patch.object(cs, "generate") as g, \
+                mock.patch.object(cs, "_atomic_write") as w:
+            with cs.config_transaction(regenerate=False) as cfg:
+                cs.find_camera(cfg, "nobody")
+        g.assert_not_called()
+        w.assert_not_called()
+
     def test_write_failure_propagates(self):
         with mock.patch.object(cs, "_atomic_write", side_effect=OSError(28, "No space")):
             with self.assertRaises(cs.ConfigWriteError):
