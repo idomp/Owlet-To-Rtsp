@@ -246,6 +246,30 @@ function syncTalkCams(names){
 }
 function talkCam(){ const s=$("talk-cam"); return (s && s.value) || "owlet"; }
 
+/* Talk-back, streamed sound playback and sound upload are refused by the
+   server unless OWLET_TALK=1 (status.talk_enabled). Disable those controls up
+   front instead of letting the user record or pick a file first. The camera's
+   own lullaby player, volume, LED and Stop are not gated and stay enabled. */
+const TALK_OFF_TITLE = "disabled: set OWLET_TALK=1";
+let _talkEnabled = true;   // until the first /api/status says otherwise
+function gateTalkEl(el){
+  if (!el) return;
+  el.disabled = !_talkEnabled;
+  if (!_talkEnabled) el.title = TALK_OFF_TITLE;
+  else if (el.title === TALK_OFF_TITLE) el.removeAttribute("title");
+}
+function applyTalkGate(enabled){
+  _talkEnabled = enabled !== false;
+  ["btn-talk","btn-sound-browse","sound-file"].forEach(id => gateTalkEl($(id)));
+  document.querySelectorAll("#sound-list .snd-play").forEach(gateTalkEl);
+  const dz=$("sound-drop");
+  if (dz){
+    dz.classList.toggle("disabled", !_talkEnabled);
+    if (!_talkEnabled) dz.title = TALK_OFF_TITLE;
+    else if (dz.title === TALK_OFF_TITLE) dz.removeAttribute("title");
+  }
+}
+
 async function loadSounds(){
   let data; try { data = await (await fetch("/api/sounds")).json(); } catch(e){ return; }
   const box = $("sound-list"); if(!box) return;
@@ -255,7 +279,9 @@ async function loadSounds(){
     const row = document.createElement("div"); row.className = "snd-row";
     row.innerHTML = `<button class="mini snd-play">▶</button><span class="snd-name">${esc(f)}</span>
       <span class="spacer"></span><button class="mini snd-del danger">🗑</button>`;
+    gateTalkEl(row.querySelector(".snd-play"));
     row.querySelector(".snd-play").onclick = async () => {
+      if (!_talkEnabled) { toast(TALK_OFF_TITLE, "warn"); return; }
       const loop = !!($("snd-loop") && $("snd-loop").checked);
       const timer_min = ($("snd-timer") ? parseFloat($("snd-timer").value) : 0) || 0;
       const r = await fetch(`/api/play/${talkCam()}`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({file:f, loop, timer_min})});
@@ -272,6 +298,7 @@ async function loadSounds(){
 }
 function uploadSounds(files){
   if(!files || !files.length) return;
+  if(!_talkEnabled){ toast(TALK_OFF_TITLE, "warn"); return; }
   const prog=$("snd-prog"), bar=$("snd-bar"); prog.classList.add("show"); bar.style.width="0%";
   let done=0;
   const one = (f) => new Promise(res => {
@@ -290,6 +317,7 @@ function uploadSounds(files){
 
 let _mediaRec=null, _chunks=[];
 async function startTalk(){
+  if(!_talkEnabled){ toast(TALK_OFF_TITLE, "warn"); return; }
   try{
     const stream = await navigator.mediaDevices.getUserMedia({audio:true});
     _chunks=[]; _mediaRec=new MediaRecorder(stream);
@@ -389,6 +417,7 @@ async function refreshStatus() {
   $("card-libs").classList.toggle("done", s.have_libs);
   $("card-cameras").classList.toggle("done", s.streams_live>0);
   updateSetup(s);
+  applyTalkGate(s.talk_enabled);
 
   const lb = $("libs-banner");
   if (lb) lb.innerHTML = s.have_libs

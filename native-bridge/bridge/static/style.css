@@ -148,6 +148,7 @@ button.danger:hover{border-color:var(--bad)}
 .dropzone{margin-top:14px;border:1.5px dashed var(--line);border-radius:10px;
   padding:18px;text-align:center;color:var(--muted);font-size:13.5px;background:#0e1318}
 .dropzone.over{border-color:var(--accent);background:rgba(63,167,255,.08);color:var(--fg)}
+.dropzone.disabled{opacity:.55;cursor:not-allowed}
 .sound-list{display:flex;flex-direction:column;gap:6px;margin-top:12px}
 .snd-row{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);
   border-radius:8px;background:#0e1318}
