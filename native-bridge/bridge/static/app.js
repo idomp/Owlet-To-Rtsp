@@ -498,12 +498,17 @@ const VITAL_META = {
 };
 const VITAL_ORDER = Object.keys(VITAL_META);
 // /api/vitals already returns °F (units=us), so no client-side conversion.
+// Values come from the camera / sock and are rendered through innerHTML, so
+// they are escaped here: a reading must never be parsed as markup.
+function escHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
 function fmtVital(k,v){
   const m=VITAL_META[k]||{unit:""};
   if(v===null||v===undefined||v==="") return "—";
-  if(m.enum) return m.enum[v]||v;
+  if(m.enum) return escHtml(m.enum[v]||v);
   if(m.bool) return (v&&v!=="0")?"On":"Off";
-  return v+m.unit;
+  return escHtml(v+m.unit);
 }
 /* "Probe my devices" runs the sock cloud snapshot, which the server refuses
    unless OWLET_VITALS_POLL=1 (status.vitals_poll) because it writes APP_ACTIVE
