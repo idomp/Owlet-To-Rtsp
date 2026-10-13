@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -134,6 +135,18 @@ def _check_once() -> int:
 # --------------------------------------------------------------------------- #
 # stage 1: restart one camera's stream process (go2rtc relaunches it)
 # --------------------------------------------------------------------------- #
+def _procs_ps() -> list[tuple[int, int, str]]:
+    """(pid, ppid, cmdline) from `ps`, for when /proc can't be listed."""
+    r = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True,
+                       text=True, timeout=10)
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            out.append((int(parts[0]), int(parts[1]), parts[2].strip()))
+    return out
+
+
 def _procs() -> list[tuple[int, int, str]]:
     """(pid, ppid, cmdline) for every process /proc lets us read."""
     out = []
@@ -281,24 +294,62 @@ def restart_producer(name: str) -> bool:
     return True
 
 
-def stop_all_producers(names=None, timeout: float = 10.0) -> list[int]:
+# Every generated stream wrapper's argv starts `set -a; OWLET_PRODUCER=<slug>;`
+# (config_store._exec_source). Wrappers generated before that marker existed
+# (and the baked-in fallback config) are recognised by their tutk log redirect.
+PRODUCER_MARKER = "OWLET_PRODUCER="
+_TUTK_LOG_REDIRECT = re.compile(r"2>>\s*\S*/tutk(?:-\S*?)?\.log")
+
+
+def is_producer_wrapper(cmd: str) -> bool:
+    """True for a go2rtc exec wrapper (the bash that runs tutk_client | ffmpeg).
+    The tutk_client python child carries neither the marker nor the redirect in
+    its argv, and a `tail` of a tutk log has no tutk_client.py in it."""
+    if "tutk_client.py" not in cmd:
+        return False
+    return PRODUCER_MARKER in cmd or bool(_TUTK_LOG_REDIRECT.search(cmd))
+
+
+def _process_table():
+    """The process table from /proc, else from `ps`; None if neither works."""
+    for source in (_procs, _procs_ps):
+        try:
+            return source()
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def stop_all_producers(names=None, timeout: float = 10.0, extra_names=()) -> list[int]:
     """Stop every camera's stream process tree (wrapper bash, tutk_client,
     ffmpeg) BEFORE go2rtc is restarted. go2rtc's /api/restart re-execs itself
     in place without stopping its exec sources, so their children used to be
     left running, still holding each camera's single P2P slot. SIGTERM the
     wrappers (their trap forwards it to tutk_client + ffmpeg), then SIGKILL
-    anything still alive after `timeout`. Returns the PIDs that were targeted."""
+    anything still alive after `timeout`. Returns the PIDs that were targeted.
+
+    Wrappers are found by their marker in the process table, NOT only by the
+    camera names in the config: the web UI saves a rename/delete before it
+    restarts go2rtc, so a producer still running under the OLD name is not in
+    the new config but still holds that camera's P2P session. The union of the
+    current config names and `extra_names` (the pre-save names the caller
+    passes) is matched too, as the fallback for wrappers the marker check
+    doesn't recognise."""
     try:
         names = list(names) if names is not None else cs.camera_names()
     except Exception:  # noqa: BLE001
         names = []
-    procs = _procs()
-    wrappers, kids = set(), set()
+    names = list(dict.fromkeys(list(names) + [n for n in extra_names if n]))
+    procs = _process_table()
+    if procs is None:
+        log("process table unreadable; cannot stop stream processes")
+        return []
+    me = os.getpid()
+    wrappers = {p for p, _pp, c in procs if p != me and is_producer_wrapper(c)}
     for n in names:
-        py, others, wr = producer_pids(n, procs)
-        kids.update(py)
-        kids.update(others)
+        _py, _others, wr = producer_pids(n, procs)
         wrappers.update(wr)
+    kids = {p for p, pp, _c in procs if pp in wrappers}
     allp = sorted(wrappers | kids)
     if not allp:
         return []

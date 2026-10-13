@@ -138,6 +138,68 @@ class StopAllProducersTests(unittest.TestCase):
         with mock.patch.object(wd, "_procs", lambda: []):
             self.assertEqual(wd.stop_all_producers(names=["owlet"]), [])
 
+    @staticmethod
+    def _wrapper_cmd(name):
+        """The cmdline /proc shows for the real generated wrapper of `name`."""
+        src = cs._exec_source(name)
+        return "bash -c " + src[len("exec:bash -c '"):src.index("'#")]
+
+    def _stop(self, procs, names, **kw):
+        sent = []
+        with mock.patch.object(wd, "_procs", lambda: procs), \
+                mock.patch.object(wd, "_kill", lambda pids, sig: sent.append((sorted(pids), sig))), \
+                mock.patch.object(wd, "_gone", lambda pids, t: True):
+            got = wd.stop_all_producers(names=names, timeout=0, **kw)
+        return got, sent
+
+    def test_generated_wrapper_carries_the_producer_marker(self):
+        cmd = self._wrapper_cmd("nursery")
+        self.assertIn("OWLET_PRODUCER=nursery;", cmd)
+        self.assertTrue(wd.is_producer_wrapper(cmd))
+        self.assertFalse(wd.is_producer_wrapper("python3 /app/tutk_client.py"))
+        self.assertFalse(wd.is_producer_wrapper("tail -n 200 /config/tutk-nursery.log"))
+
+    def test_renamed_camera_producer_is_still_stopped(self):
+        # the UI saved "nursery" -> "bedroom" before restarting go2rtc; the
+        # producer still runs under the OLD name, which the new config lacks
+        procs = [
+            (300, 1, self._wrapper_cmd("nursery")),
+            (301, 300, "python3 /app/tutk_client.py"),
+            (302, 300, "ffmpeg -f h264 -i - -f rtsp rtsp://127.0.0.1:8554/x"),
+            (400, 1, "tail -f /config/tutk-nursery.log"),            # not ours
+        ]
+        got, sent = self._stop(procs, names=["bedroom"])
+        self.assertEqual(got, [300, 301, 302])
+        self.assertIn(300, sent[0][0])
+
+    def test_deleted_camera_legacy_wrapper_without_marker_is_stopped(self):
+        legacy = ("bash -c set -a; [ -f /config/cameras/gone.env ] && . /config/cameras/gone.env; "
+                  "python3 /app/tutk_client.py 2>>/config/tutk-gone.log | ffmpeg -f h264 -i - "
+                  "-c:v copy -f rtsp rtsp://127.0.0.1:8554/x")
+        procs = [(500, 1, legacy), (501, 500, "python3 /app/tutk_client.py")]
+        got, _sent = self._stop(procs, names=[])
+        self.assertEqual(got, [500, 501])
+
+    def test_old_names_passed_by_the_caller_are_matched_too(self):
+        # an unrecognised wrapper shape is still found through the pre-save name
+        odd = "sh -c python3 /app/tutk_client.py 2>&1 >>/config/tutk-old.log"
+        procs = [(600, 1, odd), (601, 600, "python3 /app/tutk_client.py")]
+        self.assertEqual(self._stop(procs, names=["new"])[0], [])
+        got, _sent = self._stop(procs, names=["new"], extra_names=["old"])
+        self.assertEqual(got, [600, 601])
+
+    def test_falls_back_to_ps_when_proc_is_unreadable(self):
+        procs = [(700, 1, self._wrapper_cmd("cam")), (701, 700, "python3 /app/tutk_client.py")]
+
+        def no_proc():
+            raise FileNotFoundError("/proc")
+        sent = []
+        with mock.patch.object(wd, "_procs", no_proc), \
+                mock.patch.object(wd, "_procs_ps", lambda: procs), \
+                mock.patch.object(wd, "_kill", lambda pids, sig: sent.append(sorted(pids))), \
+                mock.patch.object(wd, "_gone", lambda pids, t: True):
+            self.assertEqual(wd.stop_all_producers(names=[], timeout=0), [700, 701])
+
 
 class WatchdogDefaultTests(unittest.TestCase):
     def test_off_unless_enabled(self):

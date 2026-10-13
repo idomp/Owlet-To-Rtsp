@@ -430,7 +430,12 @@ def _exec_source(name: str) -> str:
     envf = "/config/cameras/%s.env" % name
     logf = "/config/tutk-%s.log" % name
     cmd = (
-        'set -a; [ -f %(e)s ] && . %(e)s; '
+        # OWLET_PRODUCER=<slug> is the wrapper's identity marker: it sits in
+        # this bash's argv (and is exported to its children), so
+        # watchdog.stop_all_producers can find EVERY running stream wrapper in
+        # the process table without knowing the camera's (possibly renamed or
+        # deleted) config name.
+        'set -a; OWLET_PRODUCER=%(n)s; [ -f %(e)s ] && . %(e)s; '
         'D="${TMPDIR:-/tmp}"; mkdir -p "$D" 2>/dev/null; '
         'T="$D/owlet-talk-%(n)s"; rm -f "$T"; mkfifo "$T" 2>/dev/null; '
         # Audio FIFO: tutk_client writes the camera's ADTS AAC frames here and
