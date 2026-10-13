@@ -227,7 +227,9 @@ class SpareStreamTests(unittest.TestCase):
         self.assertIn("  owlet:\n", cfg)
         for sp in cs.spare_names("owlet"):
             self.assertIn(f"  {sp}:\n", cfg)
-        self.assertEqual(cfg.count(cs._exec_source("owlet")), 1 + cs.SPARE_STREAMS)
+        # sources are rendered as escaped double-quoted scalars (_yaml_str)
+        self.assertEqual(cfg.count(cs._yaml_str(cs._exec_source("owlet"))),
+                         1 + cs.SPARE_STREAMS)
 
 
 class OrphanFfmpegTests(unittest.TestCase):

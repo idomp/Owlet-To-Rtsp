@@ -36,6 +36,23 @@ def _section(text, name):
     return out
 
 
+_GO2RTC_ENV_RE = re.compile(r"\$\{([^}{]+)\}")
+
+
+def _go2rtc_replace_env_vars(text, environ):
+    """Python port of go2rtc 1.9.4 pkg/shell ReplaceEnvVars, which runs over
+    the raw config text before YAML parsing: ${NAME} -> value if set, else
+    ${NAME:default} -> default, else left as is."""
+    def sub(m):
+        key, sep, default = m.group(1).partition(":")
+        if sep and not key:          # go2rtc only splits on a colon at index > 0
+            key, sep, default = m.group(1), "", ""
+        if key in environ:
+            return environ[key]
+        return default if sep else m.group(0)
+    return _GO2RTC_ENV_RE.sub(sub, text)
+
+
 class Go2rtcAuthTests(unittest.TestCase):
     def render(self, **kw):
         return cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=("u1", "p-1_x"), **kw)
@@ -68,6 +85,46 @@ class Go2rtcAuthTests(unittest.TestCase):
         text = cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=('a"b', "c: d"))
         self.assertIn('username: "a\\"b"', text)
         self.assertIn('password: "c: d"', text)
+
+    def test_ordinary_password_renders_unchanged(self):
+        text = cs.render_go2rtc([{"name": "owlet"}], candidate="",
+                                creds=("user-1", "Ab9_x-Yz.0~"))
+        self.assertIn('username: "user-1"', text)
+        self.assertIn('password: "Ab9_x-Yz.0~"', text)
+
+    # Credentials that go2rtc's ${...} expansion would rewrite if emitted raw.
+    DOLLAR_CREDS = ("u${X:}v", "a${HOME}b")
+
+    def test_dollar_creds_leave_no_substitution_marker_in_raw_text(self):
+        text = cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=self.DOLLAR_CREDS)
+        api, rtsp = _section(text, "api"), _section(text, "rtsp")
+        for sec in (api, rtsp):
+            self.assertIn('username: "u\\u0024{X:}v"', sec)
+            self.assertIn('password: "a\\u0024{HOME}b"', sec)
+        self.assertNotIn("${", text)       # exec sources included
+
+    @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+    def test_dollar_creds_survive_go2rtc_env_substitution(self):
+        text = cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=self.DOLLAR_CREDS)
+        d = yaml.safe_load(text)
+        for sec in ("api", "rtsp"):
+            self.assertEqual(d[sec]["username"], "u${X:}v")
+            self.assertEqual(d[sec]["password"], "a${HOME}b")
+        env = {"HOME": "/root", "X": "evil"}
+        for environ in (env, {}):     # variables set, and unset (default branch)
+            with self.subTest(environ=environ):
+                d2 = yaml.safe_load(_go2rtc_replace_env_vars(text, environ))
+                for sec in ("api", "rtsp"):
+                    self.assertEqual(d2[sec]["username"].encode(), b"u${X:}v")
+                    self.assertEqual(d2[sec]["password"].encode(), b"a${HOME}b")
+                # the bash in the exec sources reaches go2rtc untouched too
+                self.assertEqual(d2["streams"], d["streams"])
+                self.assertEqual(d2["streams"]["owlet"][0], cs._exec_source("owlet"))
+
+    def test_substitution_model_matches_go2rtc(self):
+        """Sanity check of the re-implementation the test above relies on."""
+        self.assertEqual(_go2rtc_replace_env_vars("${A}|${B:d}|${C}|${D:}", {"A": "1"}),
+                         "1|d|${C}|")
 
     def test_exec_sources_contain_no_hash(self):
         """go2rtc cuts an exec source at the first '#' to parse its options

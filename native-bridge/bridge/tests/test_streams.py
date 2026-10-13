@@ -5,6 +5,7 @@ YAML-safety invariant that bit during its review.
 
 Run:  python3 -m unittest discover -s native-bridge/bridge/tests -v
 """
+import json
 import os
 import sys
 import unittest
@@ -12,17 +13,30 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config_store as cs  # noqa: E402
 
+try:
+    import yaml
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
+
+def _scalar(raw):
+    """Decode one rendered list item. Sources are double-quoted with JSON
+    escapes (`$` as \\u0024), which json.loads decodes exactly like YAML does."""
+    return json.loads(raw) if raw.startswith('"') else raw
+
 
 def sources(text):
-    """Every `    - <source>` line of a rendered config."""
-    return [ln.strip()[2:] for ln in text.splitlines() if ln.startswith("    - ")]
+    """Every `    - <source>` line of a rendered config, decoded."""
+    return [_scalar(ln.strip()[2:]) for ln in text.splitlines() if ln.startswith("    - ")]
 
 
 class YamlSafetyTests(unittest.TestCase):
-    """The generated sources are emitted as UNQUOTED YAML scalars. A ": "
-    (colon-space) in one makes a YAML parser read the line as a mapping rather
-    than a string, which breaks that stream and can corrupt neighbouring config.
-    Checked as a plain string invariant so the suite stays stdlib-only."""
+    """The generated sources used to be emitted as UNQUOTED YAML scalars, where
+    a ": " (colon-space) makes a YAML parser read the line as a mapping rather
+    than a string. They are double-quoted now; the invariant is kept as a
+    second line of defence. Checked as a plain string invariant so the suite
+    stays stdlib-only."""
 
     def test_no_colon_space_in_any_generated_source(self):
         text = cs.render_go2rtc([{"name": "owlet"}, {"name": "nursery"}])
@@ -46,8 +60,32 @@ class AudioProducerTests(unittest.TestCase):
             if ln.startswith("  ") and ln.rstrip().endswith(":") and not ln.startswith("    "):
                 cur = ln.strip().rstrip(":")
             elif ln.startswith("    - ") and cur == name:
-                out.append(ln.strip()[2:])
+                out.append(_scalar(ln.strip()[2:]))
         return out
+
+    def test_rendered_sources_hide_every_dollar_from_go2rtc(self):
+        """go2rtc substitutes ${...} in the raw text before YAML decoding and
+        treats everything after the first colon as its default, so a raw
+        `${TMPDIR:-/tmp}` became `-/tmp` whenever TMPDIR was unset. The raw
+        lines must carry no `${`; decoding must give the bash text back."""
+        raw = [ln for ln in self.text.splitlines() if ln.startswith("    - ")]
+        self.assertTrue(raw)
+        for ln in raw:
+            self.assertNotIn("${", ln)
+            self.assertNotIn("$", ln)
+        video = self._stream("owlet")[0]
+        self.assertIn('D="${TMPDIR:-/tmp}"', video)
+        self.assertIn('D="${TMPDIR:-/tmp}"', self._stream("owlet")[1])
+
+    @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+    def test_yaml_decodes_the_literal_tmpdir_expansion(self):
+        d = yaml.safe_load(self.text)
+        video, audio = d["streams"]["owlet"]
+        self.assertIn('D="${TMPDIR:-/tmp}"', video)
+        self.assertIn('D="${TMPDIR:-/tmp}"', audio)
+        self.assertEqual(video, cs._exec_source("owlet"))
+        self.assertEqual(audio, cs._audio_source("owlet"))
+        self.assertEqual(d["streams"]["owlet_overlay"], [cs._overlay_source("owlet")])
 
     def test_camera_has_video_then_audio(self):
         s = self._stream("owlet")
@@ -97,8 +135,8 @@ class AudioProducerTests(unittest.TestCase):
         self.assertIn("-ar 48000", audio)   # Opus RTP clock rate is always 48k
 
     def test_audio_producer_waits_without_shell_arithmetic(self):
-        """go2rtc expands ${...} when it loads the config but leaves bare $VAR
-        alone, so a $i counter would be substituted away and break the loop."""
+        """A literal word list instead of a counter: correct even if the text
+        ever reaches go2rtc's ${...} pre-substitution unescaped."""
         audio = self._stream("owlet")[1]
         self.assertNotIn("$((", audio)
         self.assertNotIn("$i", audio)
@@ -108,7 +146,7 @@ class AudioProducerTests(unittest.TestCase):
         import re
         for src in sources(self.text):
             for m in re.findall(r"\$\{[^}]*\}", src):
-                self.assertIn("TMPDIR", m, f"unintended go2rtc expansion: {m}")
+                self.assertIn("TMPDIR", m, f"unexpected brace expansion: {m}")
 
     def test_every_spare_carries_audio_too(self):
         """A self-heal alias swap points the camera name at a spare; a spare

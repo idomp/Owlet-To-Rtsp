@@ -720,21 +720,20 @@ def _audio_source(name: str) -> str:
     name = slugify(name)   # defense in depth: never interpolate a raw name into bash
     cmd = (
         'D="${TMPDIR:-/tmp}"; A="$D/owlet-audio-%(n)s"; '
-        # Wait (up to ~10s) for the video exec's mkfifo. Deliberately no counter
-        # variable and no arithmetic: go2rtc expands ${...} when it loads the
-        # config (that is how D= resolves to the Termux tmpdir) while leaving bare
-        # $VAR alone, so a $i / $((i+1)) here would be substituted away and break
-        # the loop. A literal word list is substitution-proof.
+        # Wait (up to ~10s) for the video exec's mkfifo. A literal word list, no
+        # counter and no arithmetic: render_go2rtc escapes every `$` so go2rtc's
+        # ${...} pre-substitution cannot touch this text, and the loop stays
+        # correct even if it ever lands in an unescaped config again.
         'for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; '
         'do [ -p "$A" ] && break; sleep 0.5; done; '
         # Still no FIFO means the video exec isn't up. Exit non-zero and let
         # go2rtc retry rather than sitting here holding a producer slot open.
         #
-        # NB: no ": " (colon-space) anywhere in this command. These sources are
-        # emitted as UNQUOTED YAML scalars, so a colon-space makes the YAML
-        # parser read the line as a MAPPING instead of a string -- which breaks
-        # the stream, and can take neighbouring config with it. Caught in review
-        # when the round-trip assertion below started parsing this as a dict.
+        # NB: no ": " (colon-space) anywhere in this command. These sources were
+        # once emitted as UNQUOTED YAML scalars, where a colon-space makes the
+        # parser read the line as a MAPPING instead of a string. They are
+        # double-quoted now (_yaml_str), but the rule is kept as a second line
+        # of defence and is still asserted by the tests.
         '[ -p "$A" ] || { echo "audio %(n)s - FIFO never appeared" >&2; exit 1; }; '
         'exec ffmpeg -hide_banner -loglevel warning -fflags +genpts '
         '-use_wallclock_as_timestamps 1 -f aac -i "$A" '
@@ -783,8 +782,25 @@ G2_SECRET_PATH = os.path.join(SECRETS_DIR, "go2rtc.json")
 
 
 def _yaml_str(v: str) -> str:
-    """A double-quoted YAML scalar (JSON strings are valid YAML)."""
-    return json.dumps(str(v))
+    """A double-quoted YAML scalar (JSON strings are valid YAML) that survives
+    go2rtc's environment substitution unchanged.
+
+    go2rtc runs `\\${([^}{]+)}` over the RAW config text before parsing it
+    (internal/app/config.go -> pkg/shell ReplaceEnvVars): `${NAME}` becomes the
+    environment value and `${NAME:default}` the default when NAME is unset. A
+    literal `${X:}` in a username would therefore render as an empty string and
+    switch authentication off. Every `$` is emitted as the YAML double-quoted
+    escape `\\u0024`, so the raw text never contains `${` while the YAML decoder
+    still yields the original string.
+
+    The exec sources go through here too. Their `${TMPDIR:-/tmp}` is bash
+    syntax, but go2rtc's pre-decode pass reads everything after the first colon
+    as ITS default, so with TMPDIR unset it rewrote the line to `D="-/tmp"`
+    before bash ever ran. Escaped, the expansion reaches bash intact and is
+    evaluated at run time against the environment go2rtc's exec children
+    inherit (exec.Command without Env), falling back to /tmp when TMPDIR is
+    unset or empty -- the same rule as talk_fifo_path() and friends."""
+    return json.dumps(str(v)).replace("$", "\\u0024")
 
 
 def go2rtc_credentials(create: bool = True) -> tuple[str, str]:
@@ -852,26 +868,28 @@ def render_go2rtc(cameras: list[dict], candidate: str | None = None,
         if valid:
             lines.append("  candidates:")
             for c in valid:
-                lines.append(f'    - "{c}"')
+                lines.append("    - " + _yaml_str(c))
     lines += ["", "streams:"]
     for cam in cameras:
         nm = slugify(cam.get("name") or "")  # never interpolate a raw name
         lines.append(f"  {nm}:")
-        lines.append("    - " + _exec_source(nm))
+        # Every source is a double-quoted scalar with `$` escaped (_yaml_str), so
+        # go2rtc's ${...} pre-substitution never touches the bash inside it.
+        lines.append("    - " + _yaml_str(_exec_source(nm)))
         # Second producer = camera audio only; go2rtc merges it into this stream.
         # Listed after the video source so video is the stream's first track.
-        lines.append("    - " + _audio_source(nm))
+        lines.append("    - " + _yaml_str(_audio_source(nm)))
         # Never-started identical spares: on a go2rtc fan-out wedge the watchdog /
         # stall supervisor alias the camera name to one of these (see
         # go2rtc_swap_to_spare). Cost nothing until used. Spares must be full
         # replacements, audio included, or a swap would silently drop sound.
         for sp in spare_names(nm):
             lines.append(f"  {sp}:")
-            lines.append("    - " + _exec_source(nm))
-            lines.append("    - " + _audio_source(nm))
+            lines.append("    - " + _yaml_str(_exec_source(nm)))
+            lines.append("    - " + _yaml_str(_audio_source(nm)))
         # Optional glass-HUD variant, on-demand (free unless viewed).
         lines.append(f"  {nm}_overlay:")
-        lines.append("    - " + _overlay_source(nm))
+        lines.append("    - " + _yaml_str(_overlay_source(nm)))
     return "\n".join(lines) + "\n"
 
 
