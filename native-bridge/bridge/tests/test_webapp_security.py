@@ -155,6 +155,38 @@ class AuthDefaultTests(WebappTestBase):
             cs.save_config(dict(cs.load_config(), ui_user="", ui_pass=""), regenerate=False)
             self.assertEqual(self.c.get("/api/cameras").status_code, 401)
 
+    def _basic(self, u, p):
+        tok = base64.b64encode(f"{u}:{p}".encode()).decode()
+        return {"Authorization": f"Basic {tok}"}
+
+    def test_password_only_env_pairs_with_admin(self):
+        with mock.patch.object(webapp, "UI_USER", ""), \
+                mock.patch.object(webapp, "UI_PASS", "env-only-pass"):
+            self.assertEqual(webapp._ui_creds(), ("admin", "env-only-pass"))
+            r = self.c.get("/api/config", headers=self._basic("admin", "env-only-pass"))
+            self.assertEqual(r.status_code, 200)
+        self.assertFalse(os.path.exists(webapp.UI_SECRET_PATH))
+
+    def test_user_only_env_pairs_with_generated_password(self):
+        with mock.patch.object(webapp, "UI_USER", "panel"), \
+                mock.patch.object(webapp, "UI_PASS", ""):
+            user, pw = webapp._ui_creds()
+            import json
+            with open(webapp.UI_SECRET_PATH) as fh:
+                stored = json.load(fh)["password"]
+            self.assertEqual((user, pw), ("panel", stored))
+            r = self.c.get("/api/config", headers=self._basic("panel", stored))
+            self.assertEqual(r.status_code, 200)
+            r = self.c.get("/api/config", headers=self._basic("admin", stored))
+            self.assertEqual(r.status_code, 401)
+
+    def test_user_only_env_pairs_with_saved_ui_password(self):
+        cs.save_config(dict(cs.load_config(), ui_user="saved", ui_pass="saved-pass"),
+                       regenerate=False)
+        with mock.patch.object(webapp, "UI_USER", "panel"), \
+                mock.patch.object(webapp, "UI_PASS", ""):
+            self.assertEqual(webapp._ui_creds(), ("panel", "saved-pass"))
+
     def test_unwritable_secret_fails_closed(self):
         with mock.patch.object(webapp, "UI_USER", ""), mock.patch.object(webapp, "UI_PASS", ""),                 mock.patch.object(webapp, "_generated_ui_creds", lambda create=True: ("", "")):
             self.assertEqual(self.c.get("/api/config").status_code, 503)

@@ -646,19 +646,24 @@ def go2rtc_credentials(create: bool = True) -> tuple[str, str]:
     """(username, password) that go2rtc requires on its API and RTSP server
     for every non-loopback client.
 
-    GO2RTC_USER / GO2RTC_PASS win when both are set. Otherwise a random
-    password is generated once and kept in <config>/secrets/go2rtc.json
-    (mode 0600), so Frigate's URL stays valid across restarts. The password
-    is never logged; read it from that file (or set the env vars)."""
+    Each half is resolved on its own:
+      * password: GO2RTC_PASS if set, else a random one generated once and
+        kept in <config>/secrets/go2rtc.json (mode 0600), so Frigate's URL
+        stays valid across restarts;
+      * username: GO2RTC_USER if set, else the one stored with the generated
+        password, else G2_USER_DEFAULT ("owlet").
+    So GO2RTC_PASS alone means "owlet" + that password, and GO2RTC_USER alone
+    means that user + the stored/generated password. The password is never
+    logged; read it from that file (or set the env vars)."""
     u = (os.environ.get("GO2RTC_USER") or "").strip()
     p = (os.environ.get("GO2RTC_PASS") or "").strip()
-    if u and p:
-        return u, p
+    if p:
+        return u or G2_USER_DEFAULT, p
     try:
         with open(G2_SECRET_PATH) as fh:
             d = json.load(fh)
-        if d.get("username") and d.get("password"):
-            return str(d["username"]), str(d["password"])
+        if d.get("password"):
+            return u or str(d.get("username") or G2_USER_DEFAULT), str(d["password"])
     except (OSError, ValueError):
         pass
     import secrets as _secrets

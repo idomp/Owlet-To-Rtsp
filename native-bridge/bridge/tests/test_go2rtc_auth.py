@@ -90,6 +90,31 @@ class Go2rtcCredentialSourceTests(unittest.TestCase):
             self.assertEqual(cs.go2rtc_credentials(), ("frigate", "s3cret"))
         self.assertFalse(os.path.exists(cs.G2_SECRET_PATH))
 
+    def _env(self, **kw):
+        env = {k: v for k, v in os.environ.items() if k not in ("GO2RTC_USER", "GO2RTC_PASS")}
+        env.update(kw)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_password_only_pairs_with_default_user(self):
+        with self._env(GO2RTC_PASS="only-pass"):
+            self.assertEqual(cs.go2rtc_credentials(), (cs.G2_USER_DEFAULT, "only-pass"))
+        self.assertFalse(os.path.exists(cs.G2_SECRET_PATH))
+
+    def test_user_only_pairs_with_stored_password(self):
+        with self._env():
+            _u, stored = cs.go2rtc_credentials()          # generated + persisted
+        with self._env(GO2RTC_USER="frigate"):
+            self.assertEqual(cs.go2rtc_credentials(), ("frigate", stored))
+            self.assertEqual(cs.go2rtc_credentials(), ("frigate", stored))
+
+    def test_user_only_with_nothing_stored_generates_password(self):
+        with self._env(GO2RTC_USER="frigate"):
+            u, p = cs.go2rtc_credentials()
+            self.assertEqual(u, "frigate")
+            self.assertEqual(cs.go2rtc_credentials(), ("frigate", p))
+        with open(cs.G2_SECRET_PATH) as fh:
+            self.assertEqual(json.load(fh)["password"], p)
+
     def test_generated_once_persisted_private_and_reused(self):
         env = {k: v for k, v in os.environ.items() if k not in ("GO2RTC_USER", "GO2RTC_PASS")}
         with mock.patch.dict(os.environ, env, clear=True):

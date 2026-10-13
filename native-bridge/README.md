@@ -45,7 +45,8 @@ native-bridge/bridge/extract-libs.sh /path/to/owlet.apk x86_64
 docker network create owlet-net   # once; attach Frigate to it too
 docker run -d --name owlet-bridge --restart unless-stopped --init --network owlet-net \
   -p 8088:8088 \
-  -e OWLET_UI_PASS='<ui password>' -e GO2RTC_PASS='<rtsp password>' \
+  -e OWLET_UI_USER='admin' -e OWLET_UI_PASS='<ui password>' \
+  -e GO2RTC_USER='owlet' -e GO2RTC_PASS='<rtsp password>' \
   -v /mnt/user/appdata/owlet/config:/config \
   -v /mnt/user/appdata/owlet/libs:/app/libs:ro \
   ghcr.io/btoth525/owlet-bridge-native:latest

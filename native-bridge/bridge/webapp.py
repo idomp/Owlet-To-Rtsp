@@ -63,10 +63,11 @@ PUBLIC_RTSP_PORT = os.environ.get("PUBLIC_RTSP_PORT", "8554")
 PUBLIC_WEBRTC_PORT = os.environ.get("PUBLIC_WEBRTC_PORT", "8555")
 
 # Web UI auth is ALWAYS on. Credentials, first match wins:
-#   1. OWLET_UI_USER + OWLET_UI_PASS (env)
+#   1. OWLET_UI_PASS (env), with OWLET_UI_USER or, if that is unset, "admin"
 #   2. ui_user + ui_pass saved from the UI
 #   3. a random password generated once into <config>/secrets/ui.json (0600),
 #      username "admin". Its location (never the password) is logged at boot.
+# OWLET_UI_USER alone renames the user of 2./3. and keeps their password.
 # If none of these can be had, the UI refuses to start / answers 503.
 UI_USER = os.environ.get("OWLET_UI_USER", "")
 UI_PASS = os.environ.get("OWLET_UI_PASS", "")
@@ -111,22 +112,35 @@ def _generated_ui_creds(create: bool = True) -> tuple[str, str]:
     if not create:
         return "", ""
     import secrets as _secrets
-    u, p = "admin", _secrets.token_urlsafe(18)
+    u, p = UI_USER_DEFAULT, _secrets.token_urlsafe(18)
     try:
         os.makedirs(os.path.dirname(UI_SECRET_PATH), mode=0o700, exist_ok=True)
         cs._atomic_write(UI_SECRET_PATH, json.dumps({"username": u, "password": p}),  # noqa: SLF001
                          mode=0o600)
     except OSError:
         return "", ""
-    log(f"control panel: no OWLET_UI_USER/OWLET_UI_PASS set — generated a password for "
-        f"user '{u}' in {UI_SECRET_PATH} (read it with `docker exec <container> cat "
+    log(f"control panel: no OWLET_UI_PASS set — generated a password for "
+        f"user '{UI_USER or u}' in {UI_SECRET_PATH} (read it with `docker exec <container> cat "
         f"{UI_SECRET_PATH}`)")
     return u, p
 
 
+UI_USER_DEFAULT = "admin"
+
+
 def _ui_creds() -> tuple[str, str]:
-    if UI_USER and UI_PASS:
-        return UI_USER, UI_PASS
+    """(user, password) for the control panel. A password alone from the env
+    pairs with the default user "admin"; a user alone from the env pairs with
+    the saved (ui_pass) or generated password."""
+    if UI_PASS:
+        return UI_USER or UI_USER_DEFAULT, UI_PASS
+    user, pw = _stored_ui_creds()
+    if UI_USER and pw:
+        return UI_USER, pw
+    return user, pw
+
+
+def _stored_ui_creds() -> tuple[str, str]:
     now = time.time()
     if now - _AUTH["t"] > 5:
         try:
