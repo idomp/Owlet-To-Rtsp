@@ -91,6 +91,25 @@ class StreamLinkPayloadTests(WebappTestBase):
         j = self._get("/api/status", {"OWLET_ADVERTISE_RTSP": "[2001:db8::7]:8554"})
         self.assertEqual((j["rtsp_host"], j["rtsp_port"]), ("[2001:db8::7]", "8554"))
 
+    def test_fully_qualified_advertise_name_keeps_its_terminal_dot(self):
+        """RFC 3986 3.2.2: a registered name may end in the root dot."""
+        for v, host in (("cams.example.:8554", "cams.example."),
+                        ("Cams.Example.:28554", "cams.example."),
+                        ("localhost.:8554", "localhost.")):
+            with self.subTest(advertise=v):
+                j = self._get("/api/status", {"OWLET_ADVERTISE_RTSP": v,
+                                              "PUBLIC_RTSP_PORT": "18554"})
+                self.assertEqual(j["rtsp_mode"], "advertised")
+                self.assertEqual(j["rtsp_host"], host)
+                self.assertEqual(j["rtsp_port"], v.rsplit(":", 1)[1])
+        # 253 characters before the root dot is the longest name allowed
+        long_name = ".".join(["a" * 63] * 3 + ["a" * 61])
+        self.assertEqual(len(long_name), 253)
+        self.assertIsNotNone(webapp._check_advertised(long_name + ".:8554")[0])
+        too_long = ".".join(["a" * 63] * 3 + ["a" * 62])
+        self.assertEqual(len(too_long), 254)
+        self.assertIsNone(webapp._check_advertised(too_long + ".:8554")[0])
+
     _MALFORMED = (
         "cams.example", ":8554", "cams.example:x", "user@cams.example:8554",
         "@cams.example:8554", "cams.example/x:8554", "cams.example:8554/live",
@@ -104,7 +123,10 @@ class StreamLinkPayloadTests(WebappTestBase):
         "cams.example:8554?", "cams.example:8554#", "cams.example:8554/",
         # host labels must be DNS labels
         "home_lab.example:8554", "-cams.example:8554", "cams-.example:8554",
-        "cams..example:8554", ".cams.example:8554", "cams.example.:8554",
+        "cams..example:8554", ".cams.example:8554",
+        # one terminal dot is allowed (fully qualified), but not two, nor a
+        # dot standing in for the whole host
+        "cams.example..:8554", ".:8554", "..:8554", ".cams.example.:8554",
         ("a" * 64) + ".example:8554", "cams.example:08554",
         "[fe80::1%eth0]:8554", "[2001:db8::7]:8554:1",
     )

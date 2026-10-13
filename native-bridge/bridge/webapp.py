@@ -931,7 +931,8 @@ def _check_advertised(v: str):
     (None, reason). The reason names the rule that failed and never contains
     any part of the value (it can hold a pasted password).
 
-    Accepted: a DNS name (valid labels) or IPv4 address, or a bracketed IPv6
+    Accepted: a DNS name (valid labels, optionally fully qualified with one
+    terminal dot, which is kept) or IPv4 address, or a bracketed IPv6
     literal, then ":" and a port in 1-65535. Anything else is rejected,
     including a user@ part, any "/", "?" or "#" (even with nothing after it)
     and whitespace."""
@@ -959,8 +960,11 @@ def _check_advertised(v: str):
         return (f"[{m.group(1).lower()}]", port), None
     if ":" in host:
         return None, "an IPv6 address must be written in brackets, [addr]:port"
-    labels = host.split(".")
-    if len(host) > 253 or not all(_ADV_LABEL_RE.fullmatch(x) for x in labels):
+    # One optional terminal dot marks a fully qualified name (RFC 3986 3.2.2
+    # allows it); it is validated away but kept in the advertised host.
+    name = host[:-1] if host.endswith(".") else host
+    labels = name.split(".")
+    if len(name) > 253 or not all(_ADV_LABEL_RE.fullmatch(x) for x in labels):
         return None, ("the host is not a valid DNS name or IPv4 address (labels of "
                       "letters, digits and hyphens, 1-63 characters, no leading or "
                       "trailing hyphen)")
