@@ -213,8 +213,11 @@ class Go2rtcCredentialSourceTests(unittest.TestCase):
     def test_env_password_with_bytes_that_are_not_utf8_is_refused_not_weakened(self):
         import io
         with mock.patch.dict(os.environ, {"GO2RTC_USER": "frigate", "GO2RTC_PASS": "p\udce4w"}), \
+                mock.patch.object(cs, "_ENV_CREDS_WARNED", [False]), \
                 mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             u, p = cs.go2rtc_credentials()
+            self.assertEqual(cs.go2rtc_credentials(), (u, p))   # stable across polls
+        self.assertEqual(err.getvalue().count("not UTF-8"), 1)   # warned once, not per lookup
         self.assertEqual(u, cs.G2_USER_DEFAULT)         # the env pair is ignored as a whole
         self.assertNotIn("\udce4", p)
         self.assertGreaterEqual(len(p), 16)              # a generated password applies

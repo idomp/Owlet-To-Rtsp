@@ -838,6 +838,9 @@ def _has_lone_surrogate(s: str) -> bool:
     return any(0xD800 <= ord(ch) <= 0xDFFF for ch in s)
 
 
+_ENV_CREDS_WARNED = [False]
+
+
 def go2rtc_credentials(create: bool = True) -> tuple[str, str]:
     """(username, password) that go2rtc requires on its API and RTSP server
     for every non-loopback client.
@@ -857,10 +860,12 @@ def go2rtc_credentials(create: bool = True) -> tuple[str, str]:
         # bytes that are not UTF-8 in the environment: go2rtc could never be
         # handed this value intact (see _yaml_str), so it is ignored and the
         # stored/generated credentials apply — never a weaker file
-        import sys
-        print("[config] GO2RTC_USER/GO2RTC_PASS contain bytes that are not UTF-8; "
-              "ignored, using the stored or generated credentials instead",
-              file=sys.stderr, flush=True)
+        if not _ENV_CREDS_WARNED[0]:   # once per process, not per panel poll
+            _ENV_CREDS_WARNED[0] = True
+            import sys
+            print("[config] GO2RTC_USER/GO2RTC_PASS contain bytes that are not UTF-8; "
+                  "ignored, using the stored or generated credentials instead",
+                  file=sys.stderr, flush=True)
         u, p = "", ""
     if p:
         return u or G2_USER_DEFAULT, p
