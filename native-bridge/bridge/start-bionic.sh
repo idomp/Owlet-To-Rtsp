@@ -14,7 +14,7 @@ if [ ! -f /config/owlet.env ]; then
   fi
 fi
 
-echo "[owlet-bridge/bionic] control panel : http://<host>:8088"
+echo "[owlet-bridge/bionic] control panel : https://<host>:8088"
 echo "[owlet-bridge/bionic] video UI       : http://<host>:1984"
 echo "[owlet-bridge/bionic] RTSP           : rtsp://<host>:8554/<camera>"
 
@@ -61,7 +61,8 @@ echo "[owlet-bridge/bionic] go2rtc config : $GO2RTC_CFG"
 # Generate a self-signed TLS cert so the control panel runs on HTTPS.
 # Browsers block microphone access on plain HTTP (non-localhost). Self-signed is
 # fine for LAN use — you'll see a one-time "not secure" warning, click proceed.
-# openssl binary is a dep of python/ffmpeg in Termux, so it's always present.
+# The openssl CLI comes from Termux's `openssl-tool` package (installed in the
+# Dockerfile); the `openssl` package alone is just the library.
 SSL_DIR=/config/ssl
 if [ ! -f "$SSL_DIR/cert.pem" ] || [ ! -f "$SSL_DIR/key.pem" ]; then
   mkdir -p "$SSL_DIR"

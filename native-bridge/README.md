@@ -44,7 +44,7 @@ native-bridge/bridge/extract-libs.sh /path/to/owlet.apk x86_64
 docker run -d --name owlet-bridge --restart unless-stopped \
   -p 8088:8088 -p 1984:1984 -p 8554:8554 -p 8555:8555/tcp -p 8555:8555/udp \
   -v /mnt/user/appdata/owlet/config:/config \
-  -v /mnt/user/appdata/owlet/libs:/app/libs:ro \
+  -v /mnt/user/appdata/owlet/libs:/app/libs \
   ghcr.io/btoth525/owlet-bridge-native:latest
 ```
 
@@ -61,7 +61,7 @@ docker compose up -d --build
 
 ## Use it
 
-1. Open **`http://<host>:8088`**.
+1. Open **`https://<host>:8088`** (self-signed certificate generated on first start; accept the browser warning once).
 2. Enter your Owlet **email / password**, pick **region**, and put your camera
    **DSN** (e.g. `OCD…`) in the *Camera DSN* field.
 3. Click **Connect & Diagnose** — the camera UID / AuthKey / AV password

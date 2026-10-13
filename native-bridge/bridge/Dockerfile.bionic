@@ -23,7 +23,11 @@ RUN /entrypoint.sh bash -c 'true'
 #    - paho-mqtt<2.0: 2.x changed Client() to require a CallbackAPIVersion; pin to
 #      the 1.x API the code targets (code is also version-aware as a backstop).
 USER 1000
-RUN bash -lc 'yes | pkg install -y python ffmpeg procps && pip install --no-cache-dir requests flask "paho-mqtt<2.0"'
+#    - openssl-tool: the `openssl` command. Termux ships the library (`openssl`,
+#      pulled in by python/ffmpeg) and the CLI as separate packages; without the
+#      CLI start-bionic.sh cannot generate the self-signed cert and the control
+#      panel silently falls back to plain HTTP.
+RUN bash -lc 'yes | pkg install -y python ffmpeg procps openssl-tool && pip install --no-cache-dir requests flask "paho-mqtt<2.0"'
 USER 0
 
 COPY --from=dl /go2rtc /usr/local/bin/go2rtc

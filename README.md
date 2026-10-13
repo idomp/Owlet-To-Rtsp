@@ -95,7 +95,7 @@ chmod -R 777 /mnt/user/appdata/owlet/config
 
 ### 3 · Provide the TUTK libraries (in the browser)
 
-The proprietary ThroughTek `.so` libraries aren't shipped — you supply your own copy of the Owlet app. Open the control panel at **`http://<unraid-ip>:8088`**, go to the **🧩 TUTK libraries** card, click **Upload & extract**, and pick your Owlet **`.apkm`** (or `.apk`). The bridge pulls the five x86‑64 libraries out of it for you.
+The proprietary ThroughTek `.so` libraries aren't shipped — you supply your own copy of the Owlet app. Open the control panel at **`https://<unraid-ip>:8088`** (self‑signed certificate, accept the warning once), go to the **🧩 TUTK libraries** card, click **Upload & extract**, and pick your Owlet **`.apkm`** (or `.apk`). The bridge pulls the five x86‑64 libraries out of it for you.
 
 > These libraries are Android binaries linked against Bionic libc, so glibc can't load them. The image runs a **Termux (Bionic) userspace** so they load on a normal x86‑64 Linux kernel — no Android, no `binder`/`ashmem`, no privileged mode.
 
@@ -109,7 +109,7 @@ In the control panel:
 
 ### 5 · Use it
 
-- Control panel: `http://<unraid-ip>:8088`
+- Control panel: `https://<unraid-ip>:8088`
 - Video UI / preview: `http://<unraid-ip>:1985`
 - **RTSP: `rtsp://<unraid-ip>:18554/<camera-name>`** ← point Frigate here.
 
