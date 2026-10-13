@@ -11,8 +11,10 @@
 #   * RTSP (8554) is NOT published. Frigate pulls it over the shared Docker
 #     network `owlet-net`, with go2rtc credentials:
 #         rtsp://<GO2RTC_USER>:<GO2RTC_PASS>@owlet-bridge:8554/<camera>
-#     (if GO2RTC_PASS is unset a random one is generated into
-#      /config/secrets/go2rtc.json, mode 0600).
+#     (GO2RTC_USER defaults to "owlet"; if GO2RTC_PASS is unset a random one
+#      is generated once into /config/secrets/go2rtc.json, mode 0600).
+# Credentials and policy switches below come from the shell or an .env file
+# next to this compose file; anything unset falls back to the default shown.
 #   * WebRTC (8555) is not published.
 # If Frigate runs with host networking instead, publish RTSP to one host IP
 # (e.g. "192.168.1.10:18554:8554") and firewall it to the Frigate host only.
@@ -31,17 +33,27 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      # Control-panel auth is always on. Without these, a random password is
-      # generated into /config/secrets/ui.json (user "admin").
+      # Control-panel auth is always on. If OWLET_UI_PASS is unset (or empty),
+      # a random password is generated once into /config/secrets/ui.json for
+      # user OWLET_UI_USER (default "admin"); `docker exec owlet-bridge cat
+      # /config/secrets/ui.json` shows it.
       OWLET_UI_USER: "${OWLET_UI_USER:-admin}"
-      OWLET_UI_PASS: "${OWLET_UI_PASS:?set OWLET_UI_PASS (control panel password)}"
-      OWLET_TALK: "0"                 # talk-back / streamed sound playback endpoints disabled
-      OWLET_VITALS_POLL: "0"          # sock cloud poller WRITES APP_ACTIVE to the sock — leave off
-      OWLET_WATCHDOG: "0"             # self-heal ladder off until validated (default)
-      OWLET_REFRESH_KMS: "0"          # no automatic Owlet cloud logins; use the saved key
-      OWLET_FORGET_ACCOUNT: "1"       # blank the stored email/password once every camera has a key
+      OWLET_UI_PASS: "${OWLET_UI_PASS:-}"
+      # 1 = enable the talk-back / streamed sound playback endpoints (audio into the nursery)
+      OWLET_TALK: "${OWLET_TALK:-0}"
+      # 1 = run the sock cloud poller; it WRITES APP_ACTIVE to the sock
+      OWLET_VITALS_POLL: "${OWLET_VITALS_POLL:-0}"
+      # 1 = enable the stream self-heal watchdog (restarts stalled streams)
+      OWLET_WATCHDOG: "${OWLET_WATCHDOG:-0}"
+      # 1 = allow automatic Owlet cloud logins to refresh a rotated camera key (rate-limited)
+      OWLET_REFRESH_KMS: "${OWLET_REFRESH_KMS:-0}"
+      # 1 = blank the stored Owlet email/password once every configured camera has a key.
+      #     Add ALL cameras first; adding one later needs the account re-entered in the control panel.
+      OWLET_FORGET_ACCOUNT: "${OWLET_FORGET_ACCOUNT:-0}"
+      # RTSP credentials Frigate uses. If GO2RTC_PASS is unset (or empty), a random
+      # password is generated once into /config/secrets/go2rtc.json.
       GO2RTC_USER: "${GO2RTC_USER:-owlet}"
-      GO2RTC_PASS: "${GO2RTC_PASS:?set GO2RTC_PASS (RTSP password Frigate uses)}"
+      GO2RTC_PASS: "${GO2RTC_PASS:-}"
     volumes:
       - ${APPDATA:-/mnt/user/appdata/owlet}/config:/config   # settings persist here
       - ./libs:/app/libs:ro                                   # TUTK .so libs (from the APK)

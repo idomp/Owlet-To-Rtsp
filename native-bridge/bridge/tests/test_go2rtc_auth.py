@@ -5,6 +5,7 @@ Run:  python3 -m unittest discover -s native-bridge/bridge/tests -v
 """
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -147,6 +148,32 @@ class DeploymentFilesTests(unittest.TestCase):
         for port in ("1984", "1985", "8554", "8555"):
             self.assertNotIn(port, text)
         self.assertIn('"8088:8088"', text)
+
+    def _compose_env(self):
+        """{VAR: value-expression} from the compose service environment."""
+        out = {}
+        with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
+            for ln in fh:
+                code = ln.split("#", 1)[0].strip()
+                m = re.match(r'^(OWLET_\w+|GO2RTC_\w+):\s*"(.*)"$', code)
+                if m:
+                    out[m.group(1)] = m.group(2)
+        return out
+
+    def test_compose_policy_switches_are_overridable_with_safe_defaults(self):
+        env = self._compose_env()
+        for var, default in (("OWLET_REFRESH_KMS", "0"), ("OWLET_FORGET_ACCOUNT", "0"),
+                             ("OWLET_VITALS_POLL", "0"), ("OWLET_WATCHDOG", "0"),
+                             ("OWLET_TALK", "0")):
+            with self.subTest(var=var):
+                self.assertEqual(env.get(var), "${%s:-%s}" % (var, default))
+
+    def test_compose_passwords_are_optional_so_the_generated_fallback_works(self):
+        env = self._compose_env()
+        self.assertEqual(env.get("GO2RTC_PASS"), "${GO2RTC_PASS:-}")
+        self.assertEqual(env.get("OWLET_UI_PASS"), "${OWLET_UI_PASS:-}")
+        with open(os.path.join(HERE, "..", "docker-compose.yml"), encoding="utf-8") as fh:
+            self.assertNotIn(":?", fh.read())   # nothing is mandatory
 
     def test_unraid_template_publishes_no_go2rtc_ports(self):
         with open(os.path.join(HERE, "..", "..", "..", "unraid",
