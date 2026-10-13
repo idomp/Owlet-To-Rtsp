@@ -127,7 +127,8 @@ def _load() -> dict:
                 # NaN compares false against everything, so a NaN deadline
                 # would grant a login on every call; treat it as corruption.
                 raise ValueError(f"{key} is not a finite non-negative number")
-    except (ValueError, TypeError) as e:
+    except (ValueError, TypeError, OverflowError) as e:
+        # OverflowError: math.isfinite() on an integer too large for a float
         raise StateUnreadable("cannot parse %s: %s" % (STATE_PATH, e)) from e
     return d
 

@@ -174,7 +174,9 @@ class UnreadableStateTests(TmpConfig):
                     # would grant a login on every call. Negative counters are
                     # nothing a writer produces either.
                     '{"attempts": 1, "next_allowed": NaN}', '{"attempts": NaN}',
-                    '{"attempts": -1}', '{"attempts": 1, "next_allowed": -5}'):
+                    '{"attempts": -1}', '{"attempts": 1, "next_allowed": -5}',
+                    # an integer too large for a float makes math.isfinite() raise
+                    '{"attempts": 1%s}' % ("0" * 309)):
             with self.subTest(raw=raw):
                 lg._UNREADABLE_LOGGED[0] = False
                 self.err.seek(0)
