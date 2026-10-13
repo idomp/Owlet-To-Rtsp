@@ -330,5 +330,29 @@ class ConfigWriteFailureTests(WebappTestBase):
         cs._write_config.assert_not_called()
 
 
+class NonAsciiCredentialTests(WebappTestBase):
+    """hmac.compare_digest() raises TypeError for str arguments outside ASCII,
+    which turned a saved non-ASCII password into a 500 on every login."""
+    N_USER, N_PASS = "usér", "pässא\U0001F476"
+
+    def test_creds_match_handles_non_ascii_without_raising(self):
+        self.assertTrue(webapp._creds_match(self.N_USER, self.N_PASS, self.N_USER, self.N_PASS))
+        self.assertFalse(webapp._creds_match(self.N_USER, "wrong", self.N_USER, self.N_PASS))
+        self.assertFalse(webapp._creds_match("", "", self.N_USER, self.N_PASS))
+        self.assertTrue(webapp._creds_match(USER, PASS, USER, PASS))
+
+    def test_non_ascii_saved_password_never_turns_logins_into_500(self):
+        with mock.patch.object(webapp, "UI_USER", self.N_USER), \
+             mock.patch.object(webapp, "UI_PASS", self.N_PASS):
+            good = base64.b64encode(f"{self.N_USER}:{self.N_PASS}".encode("utf-8")).decode()
+            r = self.c.get("/api/status", headers={"Authorization": f"Basic {good}"})
+            # the framework's header decoding decides whether non-ASCII
+            # credentials can match at all; what must never happen is a 500
+            self.assertIn(r.status_code, (200, 401), r.status_code)
+            bad = base64.b64encode(f"{self.N_USER}:nope".encode("utf-8")).decode()
+            r = self.c.get("/api/status", headers={"Authorization": f"Basic {bad}"})
+            self.assertEqual(r.status_code, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -167,10 +167,18 @@ def _auth():
         # Never fall open: no credentials means nobody gets in.
         return Response("control panel locked: set OWLET_UI_USER and OWLET_UI_PASS", 503)
     a = request.authorization
-    if a and hmac.compare_digest(a.username or "", user) \
-            and hmac.compare_digest(a.password or "", pw):
+    if a and _creds_match(a.username or "", a.password or "", user, pw):
         return None
     return Response("auth required", 401, {"WWW-Authenticate": 'Basic realm="owlet-bridge"'})
+
+
+def _creds_match(given_user: str, given_pw: str, user: str, pw: str) -> bool:
+    """Constant-time credential check. hmac.compare_digest() raises TypeError
+    for str arguments outside ASCII, which turned a saved non-ASCII password
+    into a 500 on every login; comparing the UTF-8 bytes keeps the timing
+    guarantee for any password."""
+    return hmac.compare_digest(given_user.encode("utf-8"), user.encode("utf-8")) \
+        and hmac.compare_digest(given_pw.encode("utf-8"), pw.encode("utf-8"))
 
 
 # --------------------------------------------------------------------------- #
