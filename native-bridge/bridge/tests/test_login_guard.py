@@ -6,6 +6,7 @@ the Owlet cloud client is faked, nothing touches the network.
 
 Run:  python3 -m unittest discover -s native-bridge/bridge/tests -v
 """
+import io
 import itertools
 import json
 import os
@@ -103,6 +104,115 @@ class GuardTests(TmpConfig):
         self.assertEqual(st["attempts"], 1)
         if os.name == "posix":
             self.assertEqual(os.stat(lg.STATE_PATH).st_mode & 0o777, 0o600)
+
+    def test_manual_success_then_pending_video_never_shortens_the_interval(self):
+        fp = lg.key_fingerprint("UIDX", "KEYXXXXX", b"pw")
+        for t in (0, 10_000):
+            self.assertTrue(lg.try_acquire(now=t)[0])
+        lg.set_pending("nursery", fp)
+        nxt = lg.status()["next_allowed"]
+        self.assertEqual(nxt, 10_000 + lg.delay_for(2))
+        lg.record_success()                          # manual "Connect / refresh key"
+        self.assertEqual(lg.status()["attempts"], 0)
+        self.assertEqual(lg.status()["next_allowed"], nxt)
+        self.assertEqual(lg._load()["pending_keys"], {"nursery": fp})
+        self.assertTrue(lg.record_video(fp))         # the pending key's video
+        self.assertEqual(lg.status()["attempts"], 0)  # never below zero
+        self.assertEqual(lg.status()["next_allowed"], nxt)
+        self.assertEqual(lg._load()["pending_keys"], {})
+        self.assertFalse(lg.record_video(fp))        # consumed: no second reset
+        self.assertFalse(lg.try_acquire(now=nxt - 1)[0])
+        self.assertTrue(lg.try_acquire(now=nxt)[0])
+        self.assertEqual(lg.status()["attempts"], 1)  # escalation starts over once
+        self.assertEqual(lg.status()["next_allowed"], nxt + lg.BASE)
+
+
+class UnreadableStateTests(TmpConfig):
+    """An existing state file that can't be read or parsed must fail closed:
+    no login allowance, and no writer may replace it (that would drop the
+    recorded attempts and backoff). A missing file is a normal first run."""
+    FP = "ab" * 32
+
+    def setUp(self):
+        super().setUp()
+        self.err = io.StringIO()
+        for p in (mock.patch.object(lg, "BASE", 60),
+                  mock.patch.object(lg, "MAX_ATTEMPTS", 5),
+                  mock.patch.object(lg, "_MEM_PENDING", {}),
+                  mock.patch.object(lg, "_UNREADABLE_LOGGED", [False]),
+                  mock.patch.object(sys, "stderr", self.err)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _write(self, raw):
+        os.makedirs(os.path.dirname(lg.STATE_PATH), exist_ok=True)
+        with open(lg.STATE_PATH, "w") as fh:
+            fh.write(raw)
+
+    def _raw(self):
+        with open(lg.STATE_PATH, "rb") as fh:
+            return fh.read()
+
+    def _assert_fails_closed(self):
+        before = self._raw()
+        ok, why = lg.try_acquire(now=10 ** 9)
+        self.assertFalse(ok)
+        self.assertTrue(why.startswith("login guard state unreadable"), why)
+        lg.set_pending("nursery", self.FP)
+        lg.record_success()
+        self.assertFalse(lg.record_video(self.FP))
+        self.assertEqual(self._raw(), before)        # no writer replaced it
+        st = lg.status()
+        self.assertIsNone(st["attempts"])
+        self.assertIn("unreadable", st["error"])
+        self.assertEqual(self.err.getvalue().count("login guard:"), 1)  # logged once
+
+    def test_corrupt_state_fails_closed(self):
+        for raw in ('{"attempts": 2, "next_al', "", "[]", '{"attempts": "x"}',
+                    '{"attempts": 1, "next_allowed": []}'):
+            with self.subTest(raw=raw):
+                lg._UNREADABLE_LOGGED[0] = False
+                self.err.seek(0)
+                self.err.truncate()
+                self._write(raw)
+                self._assert_fails_closed()
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+                         "needs POSIX permissions and a non-root user")
+    def test_unreadable_state_fails_closed_and_keeps_the_backoff(self):
+        self._write(json.dumps({"attempts": 3, "next_allowed": 12345.0}))
+        os.chmod(lg.STATE_PATH, 0)
+        try:
+            ok, why = lg.try_acquire(now=10 ** 9)
+            self.assertFalse(ok)
+            self.assertTrue(why.startswith("login guard state unreadable"), why)
+            lg.set_pending("nursery", self.FP)
+            lg.record_success()
+            self.assertFalse(lg.record_video(self.FP))
+            self.assertIn("unreadable", lg.status()["error"])
+        finally:
+            os.chmod(lg.STATE_PATH, 0o600)
+        self.assertEqual(json.loads(self._raw()), {"attempts": 3, "next_allowed": 12345.0})
+
+    def test_missing_file_is_a_fresh_state(self):
+        self.assertFalse(os.path.exists(lg.STATE_PATH))
+        self.assertEqual(lg.status(), {"attempts": 0, "max_attempts": 5,
+                                       "next_allowed": 0, "error": None})
+        self.assertTrue(lg.try_acquire(now=1000)[0])
+        lg.set_pending("nursery", self.FP)
+        self.assertEqual(lg.status()["attempts"], 1)
+        self.assertEqual(lg._load()["pending_keys"], {"nursery": self.FP})
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_memory_only_pending_counts_once_the_file_is_repaired(self):
+        self._write("{broken")
+        lg.set_pending("nursery", self.FP)           # kept in memory only
+        self.assertEqual(lg._MEM_PENDING, {"nursery": self.FP})
+        self._write(json.dumps({"attempts": 2, "next_allowed": 500.0}))
+        self.assertTrue(lg.record_video(self.FP))
+        self.assertEqual(lg.status()["attempts"], 0)
+        self.assertEqual(lg.status()["next_allowed"], 500.0)
+        self.assertEqual(lg._MEM_PENDING, {})
 
 
 class FakeAPI:

@@ -32,6 +32,12 @@ pending across failed sessions and process restarts until a session with
 that exact key delivers video (record_video(): attempts -> 0, pending
 cleared) or the next changed-key fetch for that camera supersedes it. Video
 from any other key (the saved key, another camera's) leaves the guard alone.
+
+A missing state file is a first run. A state file that exists but cannot be
+read or parsed fails closed: automatic logins are refused, no writer replaces
+the file (pending attributions are held in memory only), status() reports the
+problem, and it is logged once per process until the file is repaired or
+removed.
 """
 from __future__ import annotations
 
@@ -39,6 +45,7 @@ import contextlib
 import hashlib
 import json
 import os
+import sys
 import time
 
 import config_store as cs
@@ -73,13 +80,51 @@ def _locked():
         os.close(fd)
 
 
+class StateUnreadable(Exception):
+    """The state file exists but cannot be read or parsed. Never treated as
+    "no state": that would hand out a fresh login allowance (fail open) and
+    let the next write replace the recorded attempts and backoff."""
+
+
+# Pending fingerprints that could not be written because the state file was
+# unreadable: the attribution lives in this process only (see set_pending).
+_MEM_PENDING: dict[str, str] = {}
+_UNREADABLE_LOGGED = [False]
+
+
+def _warn_unreadable(err: StateUnreadable) -> None:
+    """Log the unreadable state file once per process (stderr reaches the
+    per-camera tutk log and the web app's log)."""
+    if _UNREADABLE_LOGGED[0]:
+        return
+    _UNREADABLE_LOGGED[0] = True
+    print(f"login guard: {err}; automatic logins are refused and the file is left "
+          "untouched until it is repaired or removed", file=sys.stderr, flush=True)
+
+
 def _load() -> dict:
+    """The guard state. A missing file is an empty state (first run); a file
+    that exists but cannot be read, is not valid JSON, is not an object or
+    holds non-numeric counters raises StateUnreadable."""
     try:
         with open(STATE_PATH) as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
+            raw = fh.read()
+    except FileNotFoundError:
         return {}
+    except (OSError, UnicodeDecodeError) as e:
+        raise StateUnreadable("cannot read %s: %s" % (
+            STATE_PATH, getattr(e, "strerror", None) or e)) from e
+    try:
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            raise ValueError("not a JSON object")
+        for key in ("attempts", "next_allowed"):
+            v = d.get(key)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                raise ValueError(f"{key} is not a number")
+    except (ValueError, TypeError) as e:
+        raise StateUnreadable("cannot parse %s: %s" % (STATE_PATH, e)) from e
+    return d
 
 
 def _save(d: dict) -> None:
@@ -93,11 +138,16 @@ def delay_for(attempt: int) -> int:
 
 def try_acquire(now: float | None = None) -> tuple[bool, str]:
     """Reserve one automatic login. (True, "") if allowed (already recorded),
-    else (False, reason). Fails closed: if the state can't be stored, no login."""
+    else (False, reason). Fails closed: if the state can't be read or stored,
+    no login."""
     now = time.time() if now is None else now
     try:
         with _locked():
-            st = _load()
+            try:
+                st = _load()
+            except StateUnreadable as e:
+                _warn_unreadable(e)
+                return False, f"login guard state unreadable ({e})"
             attempts = int(st.get("attempts") or 0)
             if attempts >= MAX_ATTEMPTS:
                 return False, (f"automatic login cap reached ({attempts}/{MAX_ATTEMPTS}); "
@@ -122,10 +172,17 @@ def record_success() -> None:
     moves it, so after any automatic login the next one stays blocked for at
     least BASE seconds whatever happens in between. Clearing it here let a
     transient failure, a login and a saved-key session with video repeat as
-    fast as the camera reconnects."""
+    fast as the camera reconnects.
+
+    An unreadable state file is left as it is (logged once): rewriting it
+    would replace the recorded backoff with a guess."""
     try:
         with _locked():
-            st = _load()
+            try:
+                st = _load()
+            except StateUnreadable as e:
+                _warn_unreadable(e)
+                return
             if st.get("attempts"):
                 st.update(attempts=0, last_ok=time.time())
                 _save(st)
@@ -150,11 +207,22 @@ def _pending(st: dict) -> dict:
 def set_pending(camera: str, fingerprint: str) -> None:
     """An automatic refresh fetched a NEW key for `camera`: remember its
     fingerprint until it delivers video. Replaces (supersedes) that camera's
-    previous pending key. Raises OSError if the state can't be stored."""
+    previous pending key. Raises OSError if the state can't be stored.
+
+    If the state file exists but is unreadable it is NOT rewritten (that would
+    drop the recorded attempts and backoff): the fingerprint is kept in this
+    process's memory only, and the problem is logged once."""
+    cam = camera or ""
     with _locked():
-        st = _load()
+        try:
+            st = _load()
+        except StateUnreadable as e:
+            _MEM_PENDING[cam] = fingerprint
+            _warn_unreadable(e)
+            return
+        _MEM_PENDING.pop(cam, None)       # superseded by the stored entry
         pend = _pending(st)
-        pend[camera or ""] = fingerprint
+        pend[cam] = fingerprint
         st["pending_keys"] = pend
         _save(st)
 
@@ -164,15 +232,32 @@ def record_video(fingerprint: str) -> bool:
     is a pending refreshed key, the login that fetched it worked: reset the
     escalation like record_success() (next_allowed untouched) and clear the
     pending entry. Any other key changes nothing. Returns True on a reset.
-    Raises OSError if the state can't be read-locked or stored."""
+    Raises OSError if the state can't be read-locked or stored.
+
+    With an unreadable state file nothing is written (logged once); a match
+    against a fingerprint held in memory only clears that entry and returns
+    False, since no reset could be recorded."""
     with _locked():
-        st = _load()
+        mem_hits = [cam for cam, fp in _MEM_PENDING.items() if fp == fingerprint]
+        try:
+            st = _load()
+        except StateUnreadable as e:
+            for cam in mem_hits:
+                del _MEM_PENDING[cam]
+            _warn_unreadable(e)
+            return False
         pend = _pending(st)
         hits = [cam for cam, fp in pend.items() if fp == fingerprint]
+        # A fingerprint parked in memory while the file was unreadable still
+        # counts once the file is readable again, unless the stored state
+        # already has a newer pending key for that camera.
+        hits += [cam for cam in mem_hits if cam not in pend]
+        for cam in mem_hits:
+            del _MEM_PENDING[cam]
         if not hits:
             return False
         for cam in hits:
-            del pend[cam]
+            pend.pop(cam, None)
         st["pending_keys"] = pend
         st.update(attempts=0, last_ok=time.time())
         _save(st)
@@ -180,6 +265,13 @@ def record_video(fingerprint: str) -> bool:
 
 
 def status() -> dict:
-    st = _load()
+    """Current counters. With an unreadable state file `attempts` and
+    `next_allowed` are None (unknown) and `error` says why; automatic logins
+    are refused until the file is repaired or removed."""
+    try:
+        st = _load()
+    except StateUnreadable as e:
+        return {"attempts": None, "max_attempts": MAX_ATTEMPTS, "next_allowed": None,
+                "error": f"login guard state unreadable ({e})"}
     return {"attempts": int(st.get("attempts") or 0), "max_attempts": MAX_ATTEMPTS,
-            "next_allowed": st.get("next_allowed") or 0}
+            "next_allowed": st.get("next_allowed") or 0, "error": None}
