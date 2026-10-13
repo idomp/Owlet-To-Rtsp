@@ -169,7 +169,12 @@ class UnreadableStateTests(TmpConfig):
 
     def test_corrupt_state_fails_closed(self):
         for raw in ('{"attempts": 2, "next_al', "", "[]", '{"attempts": "x"}',
-                    '{"attempts": 1, "next_allowed": []}'):
+                    '{"attempts": 1, "next_allowed": []}',
+                    # NaN compares false against everything: a NaN deadline
+                    # would grant a login on every call. Negative counters are
+                    # nothing a writer produces either.
+                    '{"attempts": 1, "next_allowed": NaN}', '{"attempts": NaN}',
+                    '{"attempts": -1}', '{"attempts": 1, "next_allowed": -5}'):
             with self.subTest(raw=raw):
                 lg._UNREADABLE_LOGGED[0] = False
                 self.err.seek(0)
@@ -203,6 +208,29 @@ class UnreadableStateTests(TmpConfig):
         self.assertEqual(lg.status()["attempts"], 1)
         self.assertEqual(lg._load()["pending_keys"], {"nursery": self.FP})
         self.assertEqual(self.err.getvalue(), "")
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+                         "needs POSIX permissions and a non-root user")
+    def test_memory_pending_supersedes_a_stale_stored_entry(self):
+        # The file holds an older pending key A for the camera, becomes
+        # unreadable, a refresh obtains B (parked in memory), the file becomes
+        # readable again still holding A. Video from B must reset the guard:
+        # the memory entry is newer than anything the file has for that camera.
+        old = "0" * 64
+        self._write(json.dumps({"attempts": 2, "next_allowed": 500.0,
+                                "pending_keys": {"nursery": old}}))
+        os.chmod(lg.STATE_PATH, 0)
+        try:
+            lg.set_pending("nursery", self.FP)
+            self.assertEqual(lg._MEM_PENDING, {"nursery": self.FP})
+        finally:
+            os.chmod(lg.STATE_PATH, 0o600)
+        self.assertTrue(lg.record_video(self.FP))
+        self.assertEqual(lg.status()["attempts"], 0)
+        self.assertEqual(lg.status()["next_allowed"], 500.0)
+        self.assertEqual(lg._MEM_PENDING, {})
+        with open(lg.STATE_PATH) as fh:
+            self.assertNotIn("nursery", json.load(fh).get("pending_keys", {}))
 
     def test_memory_only_pending_counts_once_the_file_is_repaired(self):
         self._write("{broken")

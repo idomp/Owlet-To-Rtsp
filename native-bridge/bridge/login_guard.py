@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -122,6 +123,10 @@ def _load() -> dict:
             v = d.get(key)
             if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
                 raise ValueError(f"{key} is not a number")
+            if v is not None and (not math.isfinite(v) or v < 0):
+                # NaN compares false against everything, so a NaN deadline
+                # would grant a login on every call; treat it as corruption.
+                raise ValueError(f"{key} is not a finite non-negative number")
     except (ValueError, TypeError) as e:
         raise StateUnreadable("cannot parse %s: %s" % (STATE_PATH, e)) from e
     return d
@@ -249,9 +254,11 @@ def record_video(fingerprint: str) -> bool:
         pend = _pending(st)
         hits = [cam for cam, fp in pend.items() if fp == fingerprint]
         # A fingerprint parked in memory while the file was unreadable still
-        # counts once the file is readable again, unless the stored state
-        # already has a newer pending key for that camera.
-        hits += [cam for cam in mem_hits if cam not in pend]
+        # counts once the file is readable again. It is always newer than
+        # whatever the file holds for that camera: a later set_pending() that
+        # reached the file would have dropped the memory entry, so a stale
+        # stored entry must not shadow it.
+        hits += [cam for cam in mem_hits if cam not in hits]
         for cam in mem_hits:
             del _MEM_PENDING[cam]
         if not hits:
