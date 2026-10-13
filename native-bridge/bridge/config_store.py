@@ -378,6 +378,37 @@ def config_lock():
     return _config_file_lock()
 
 
+def _snapshot(obj, pairs: list):
+    """Copy a JSON-like tree, appending (original container, its copy) to
+    `pairs` for every dict and list, so _restore_in_place() can put the
+    snapshot back into the ORIGINAL objects."""
+    if isinstance(obj, dict):
+        c = {k: _snapshot(v, pairs) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        c = [_snapshot(v, pairs) for v in obj]
+    else:
+        return copy.deepcopy(obj)
+    pairs.append((obj, c))
+    return c
+
+
+def _restore_in_place(pairs: list) -> None:
+    """Roll every container recorded by _snapshot() back to its snapshot by
+    clearing and refilling the same dict/list object, at every depth, so any
+    reference a caller still holds (mqtt = cfg["mqtt"]) stays the live one,
+    even if the failed block replaced, moved or removed that container."""
+    back = {id(c): o for o, c in pairs}
+
+    def real(v):
+        return back.get(id(v), v)
+    for orig, snap in pairs:
+        if isinstance(orig, dict):
+            orig.clear()
+            orig.update((k, real(v)) for k, v in snap.items())
+        else:
+            orig[:] = [real(v) for v in snap]
+
+
 @contextlib.contextmanager
 def config_transaction(regenerate: bool = True):
     """Read-modify-write the config under the shared config lock:
@@ -399,16 +430,17 @@ def config_transaction(regenerate: bool = True):
     change (and regenerates if any level asked for it). If an inner block
     raises, its changes are rolled back in the shared dict before the
     exception propagates, so an outer block that catches it commits only its
-    own changes."""
+    own changes. The rollback is done in place at every level, so references
+    to nested dicts/lists the outer block took earlier remain valid."""
     outer = getattr(_CFG_DEPTH, "txn", None)
     if outer is not None:
         cfg = outer["cfg"]
-        snapshot = copy.deepcopy(cfg)
+        pairs: list = []
+        _snapshot(cfg, pairs)
         try:
             yield cfg
         except BaseException:
-            cfg.clear()
-            cfg.update(snapshot)
+            _restore_in_place(pairs)
             raise
         if regenerate:
             outer["regenerate"] = True

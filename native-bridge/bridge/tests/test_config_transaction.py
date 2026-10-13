@@ -153,6 +153,30 @@ class TransactionTests(TmpConfig):
         self.assertEqual(saved["mqtt"]["prefix"], "ha")
         self.assertEqual([c["name"] for c in saved["cameras"]], ["nursery"])
 
+    def test_failed_inner_keeps_outer_references_live(self):
+        with cs.config_transaction(regenerate=False) as cfg:
+            mqtt = cfg["mqtt"]
+            cams = cfg["cameras"]
+            cam = cams[0]
+            try:
+                with cs.config_transaction(regenerate=False) as inner:
+                    inner["mqtt"]["prefix"] = "inner"
+                    inner["mqtt"] = {"host": "replaced.example.com"}
+                    inner["cameras"].pop(0)
+                    inner["cameras"].append({"name": "hall"})
+                    raise ValueError("abort inner")
+            except ValueError:
+                pass
+            self.assertIs(cfg["mqtt"], mqtt)
+            self.assertIs(cfg["cameras"], cams)
+            self.assertIs(cfg["cameras"][0], cam)
+            self.assertNotEqual(mqtt.get("prefix"), "inner")
+            mqtt["host"] = "broker.example.com"      # through the old references
+            cam["name"] = "nursery2"
+        saved = cs.load_config()
+        self.assertEqual(saved["mqtt"]["host"], "broker.example.com")
+        self.assertEqual([c["name"] for c in saved["cameras"]], ["nursery2"])
+
     def test_save_config_inside_a_transaction_raises(self):
         with cs.config_transaction(regenerate=False):
             with self.assertRaises(RuntimeError):
