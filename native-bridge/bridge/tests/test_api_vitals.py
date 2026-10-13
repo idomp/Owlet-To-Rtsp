@@ -88,6 +88,18 @@ class ApiVitalsTests(unittest.TestCase):
         dev = self.get().get("den")
         self.assertTrue(dev is None or not dev["sensors"].get("temperature"))
 
+    def test_cached_camera_no_longer_configured_is_dropped(self):
+        # "attic" was renamed/deleted; only its old snapshot copy remains
+        self.cached({"dsn": "attic", "name": "attic", "kind": "cam",
+                     "sensors": {"temperature": 19}, "ts": self.now - 30},
+                    {"dsn": "SOCK1", "name": "sock", "kind": "sock",
+                     "sensors": {"heart_rate": 120}, "ts": self.now - 30})
+        self.sidecar("nursery", temperature=(22, 1))
+        devs = self.get()
+        self.assertNotIn("attic", devs)
+        self.assertIn("SOCK1", devs)
+        self.assertEqual(devs["nursery"]["sensors"]["temperature"], 22)
+
     def test_cloud_devices_in_the_snapshot_are_kept(self):
         self.cached({"dsn": "SOCK1", "name": "sock", "kind": "sock",
                      "sensors": {"heart_rate": 120}, "ts": self.now - 30})

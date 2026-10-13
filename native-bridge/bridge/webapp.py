@@ -709,15 +709,21 @@ def vitals_latest():
     # Cam room-sensors: always the freshly filtered sidecar data. The snapshot's
     # copy of a camera is up to a poll cycle old (arbitrarily old when the
     # publisher is off), so it is REPLACED, never merged with: a camera whose
-    # fields expired must lose them here, not keep its last values.
+    # fields expired must lose them here, not keep its last values. A cached
+    # camera that is no longer configured (renamed or deleted) is dropped too.
     cams = _cam_sensor_devices()
     try:
-        local = set(cs.camera_names())
+        cs.camera_names()
+        config_known = True
     except Exception:  # noqa: BLE001
-        local = set()
-    local.update(c["dsn"] for c in cams)
+        config_known = False
+    fresh = {c["dsn"] for c in cams}
+    # With the camera list readable, every cached camera entry goes: the
+    # configured ones are replaced by `cams`, the rest no longer exist. If the
+    # config can't be read, only the cameras with fresh data are replaced.
     payload["devices"] = [d for d in payload.get("devices") or []
-                          if not (d.get("kind") == "cam" and d.get("dsn") in local)] + cams
+                          if d.get("kind") != "cam"
+                          or (not config_known and d.get("dsn") not in fresh)] + cams
     _convert_units(payload.get("devices", []), units)
     payload["units"] = "metric" if units == "metric" else "us"
     return jsonify(payload)
