@@ -882,7 +882,7 @@ def _api_published() -> bool:
 
 
 def _valid_port(v: str) -> bool:
-    return v.isdigit() and 0 < int(v) < 65536
+    return v.isascii() and v.isdigit() and 0 < int(v) < 65536
 
 
 def _rtsp_listen_port() -> str:
@@ -904,16 +904,53 @@ def _request_hostname() -> str:
     return f"[{host}]" if ":" in host else host
 
 
+_ADV_HOST_RE = re.compile(r"[A-Za-z0-9._-]+")
+_adv_rejected: set = set()   # malformed OWLET_ADVERTISE_RTSP values already logged
+
+
+def _parse_advertised(v: str):
+    """Validate a whole "host:port" authority -> (host, port) or None.
+
+    Accepted: a DNS name or IPv4 address, or a bracketed IPv6 literal, then a
+    port in 1-65535. Rejected: no port, userinfo, path/query/fragment,
+    whitespace, an unbracketed IPv6 literal, any other character."""
+    import ipaddress
+    if not v or any(c.isspace() for c in v):
+        return None
+    try:
+        u = urlparse("//" + v)
+        host, port = u.hostname, u.port        # .port raises on junk / out of range
+    except ValueError:
+        return None
+    if (not host or not port or u.path or u.params or u.query or u.fragment
+            or "@" in u.netloc):
+        return None
+    if u.netloc.rsplit(":", 1)[-1] != str(port):   # "+8554", "08554", non-ASCII digits
+        return None
+    if u.netloc.startswith("["):
+        try:
+            if ipaddress.ip_address(host).version != 6:
+                return None
+        except ValueError:
+            return None
+        return f"[{host}]", str(port)
+    if not _ADV_HOST_RE.fullmatch(host):      # also catches unbracketed IPv6
+        return None
+    return host, str(port)
+
+
 def _rtsp_advertised():
-    """OWLET_ADVERTISE_RTSP="host:port" -> (host, port), else None."""
+    """OWLET_ADVERTISE_RTSP="host:port" -> (host, port), else None. A malformed
+    value is logged once and ignored, so the next precedence level applies."""
     v = (os.environ.get("OWLET_ADVERTISE_RTSP") or "").strip()
-    if ":" not in v:
+    if not v:
         return None
-    host, port = v.rsplit(":", 1)
-    host = host.strip()
-    if not host or not _valid_port(port.strip()) or "/" in host or "@" in host:
-        return None
-    return host, port.strip()
+    parsed = _parse_advertised(v)
+    if parsed is None and v not in _adv_rejected:
+        _adv_rejected.add(v)
+        print(f"[webapp] ignoring OWLET_ADVERTISE_RTSP={v!r}: expected host:port "
+              "(IPv6 as [addr]:port, no user@, path, query or spaces)", flush=True)
+    return parsed
 
 
 def _stream_endpoints() -> dict:

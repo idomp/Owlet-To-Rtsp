@@ -89,13 +89,47 @@ class StreamLinkPayloadTests(WebappTestBase):
         j = self._get("/api/status", {"OWLET_ADVERTISE_RTSP": "[2001:db8::7]:8554"})
         self.assertEqual((j["rtsp_host"], j["rtsp_port"]), ("[2001:db8::7]", "8554"))
 
+    _MALFORMED = (
+        "cams.example", ":8554", "cams.example:x", "user@cams.example:8554",
+        "@cams.example:8554", "cams.example/x:8554", "cams.example:8554/live",
+        "cams.example:8554?x=1", "cams.example?:8554", "cams.example:8554#f",
+        "cams.example#:8554", "cams example:8554", "cams.example :8554",
+        "cams\t.example:8554", "cams.example:0", "cams.example:70000",
+        "cams.example:+8554", "cams.example:８５５４", "cams.exa%41mple:8554",
+        "cams.example,b:8554", "2001:db8::7:8554", "2001:db8::7", "[2001:db8::7]",
+        "[cams.example]:8554", "[192.0.2.7]:8554", "[2001:db8::7:8554",
+    )
+
     def test_malformed_advertise_falls_back(self):
-        for v in ("cams.example", ":8554", "cams.example:x", "user@cams.example:8554",
-                  "cams.example/x:8554"):
+        for v in self._MALFORMED:
             with self.subTest(advertise=v):
                 j = self._get("/api/status", {"OWLET_ADVERTISE_RTSP": v})
                 self.assertEqual(j["rtsp_mode"], "network")
                 self.assertEqual(j["rtsp_host"], "owlet-camera")
+
+    def test_malformed_advertise_falls_through_to_public_port(self):
+        j = self._get("/api/status", {"OWLET_ADVERTISE_RTSP": "2001:db8::7:8554",
+                                      "PUBLIC_RTSP_PORT": "18554"}, host="nas.example:8088")
+        self.assertEqual((j["rtsp_mode"], j["rtsp_host"], j["rtsp_port"]),
+                         ("published", "nas.example", "18554"))
+
+    def test_malformed_advertise_is_logged_once(self):
+        webapp._adv_rejected.clear()
+        with mock.patch("builtins.print") as p:
+            for _ in range(3):
+                self._get("/api/status", {"OWLET_ADVERTISE_RTSP": "cams.example/x:8554"})
+        lines = [c for c in p.call_args_list if "OWLET_ADVERTISE_RTSP" in str(c)]
+        self.assertEqual(len(lines), 1)
+
+    def test_valid_advertise_forms(self):
+        for v, want in (("[::1]:8554", ("[::1]", "8554")),
+                        ("[2001:DB8::7]:18554", ("[2001:db8::7]", "18554")),
+                        ("192.0.2.7:8554", ("192.0.2.7", "8554")),
+                        ("cam-1.home_lab.example:65535", ("cam-1.home_lab.example", "65535"))):
+            with self.subTest(advertise=v):
+                j = self._get("/api/status", {"OWLET_ADVERTISE_RTSP": v})
+                self.assertEqual(j["rtsp_mode"], "advertised")
+                self.assertEqual((j["rtsp_host"], j["rtsp_port"]), want)
 
     def test_env_user_is_reported(self):
         j = self._get("/api/status", {"GO2RTC_USER": "frigate", "GO2RTC_PASS": "s3cret"})
