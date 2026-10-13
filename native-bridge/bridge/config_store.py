@@ -197,7 +197,8 @@ def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
         return cfg
     try:
-        raw = open(CONFIG_PATH).read()
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            raw = fh.read()
     except Exception:  # noqa: BLE001
         return cfg
     data: dict = {}
