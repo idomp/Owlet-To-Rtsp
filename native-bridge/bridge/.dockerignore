@@ -1,0 +1,7 @@
+# Build context hygiene for both Dockerfiles in this directory.
+tests/
+__pycache__/
+**/__pycache__/
+*.pyc
+# Proprietary TUTK libraries are mounted at /app/libs, never baked into an image.
+libs/**/*.so

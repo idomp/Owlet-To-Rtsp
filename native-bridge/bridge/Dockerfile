@@ -1,15 +1,15 @@
 # owlet-bridge — native Owlet/Kalay -> RTSP, the wyze-bridge way.
-#   control panel (Flask) :8088  |  go2rtc video UI :1984  |  RTSP :8554
+#   control panel (Flask, HTTPS) :8088  |  RTSP :8554 (authenticated)
+#   go2rtc API :1984 stays on container loopback unless GO2RTC_API_LISTEN is set.
 #
 # The proprietary TUTK .so libs are NOT shipped. Extract them from the Owlet APK
-# you own (native-bridge/tutk/extract-libs.sh) and mount at /app/libs, or COPY
-# them in before building.
+# you own (extract-libs.sh) and mount them at /app/libs.
 FROM python:3.12-slim
 
 ARG GO2RTC_VERSION=1.9.4
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl ffmpeg libstdc++6 \
+        ca-certificates curl ffmpeg libstdc++6 openssl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL -o /usr/local/bin/go2rtc \
@@ -20,9 +20,9 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY owlet_api.py tutk_client.py webapp.py go2rtc.yaml entrypoint.sh /app/
-COPY templates/ /app/templates/
-COPY static/ /app/static/
+# The whole bridge directory, so every module the code imports is present
+# (.dockerignore keeps tests, caches and any local TUTK .so files out).
+COPY . /app/
 RUN chmod +x /app/entrypoint.sh
 
 ENV TUTK_LIB_DIR=/app/libs/x86_64 \
