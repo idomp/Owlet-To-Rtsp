@@ -19,40 +19,51 @@ Stdlib only — the go2rtc YAML is hand-rendered so we don't need PyYAML.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import os
 import re
+import secrets
+import threading
 
 # A WebRTC candidate is "<host-or-ip>:<port>" (v4, bracketed v6, or hostname).
 _CAND_RE = re.compile(r"^[\w.\[\]:-]+:\d{1,5}$")
 
 
+def _tmp_name(path: str) -> str:
+    """A temp file name next to `path` that no other writer (thread or
+    process) will pick: <name>.tmp-<pid>-<random>."""
+    return f"{path}.tmp-{os.getpid()}-{secrets.token_hex(6)}"
+
+
 def _atomic_write(path: str, text: str, mode: int | None = 0o600) -> None:
-    """Write text to path atomically: tmp file + fsync + os.replace. A crash,
-    SIGKILL, or full disk mid-write can never leave a half-written/empty file
-    (which previously could silently wipe the saved config). The file is
-    created with `mode` (default 0600: everything written here is a credential
-    or derived from one) with no world-readable window; mode=None keeps the
-    process umask."""
-    tmp = path + ".tmp"
-    if mode is None:
-        fh = open(tmp, "w")
-    else:
+    """Write text to path atomically: unique tmp file + fsync + os.replace. A
+    crash, SIGKILL, or full disk mid-write can never leave a half-written/empty
+    file (which previously could silently wipe the saved config), and two
+    concurrent writers never share a temp file. The file is created with
+    `mode` (default 0600: everything written here is a credential or derived
+    from one) with no world-readable window; mode=None keeps the process umask."""
+    tmp = _tmp_name(path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                 0o666 if mode is None else mode)
+    try:
+        if mode is not None:
+            try:
+                os.chmod(tmp, mode)   # umask may have narrowed it; never widened
+            except OSError:
+                pass
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
         try:
             os.remove(tmp)
         except OSError:
             pass
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-        try:
-            os.chmod(tmp, mode)   # umask may have narrowed it; never widened
-        except OSError:
-            pass
-        fh = os.fdopen(fd, "w")
-    with fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+        raise
 
 
 def _sh_squote(v) -> str:
@@ -269,9 +280,13 @@ def _account_of(cfg: dict) -> dict:
     return {k: cfg.get(k, ACCOUNT_DEFAULTS[k]) for k in ACCOUNT_FIELDS}
 
 
-def save_config(cfg: dict, regenerate: bool = True) -> bool:
-    """Persist config (JSON) and regenerate the per-camera envs + go2rtc config.
-    Returns False if the config folder isn't writable."""
+class ConfigWriteError(OSError):
+    """The config (or the files generated from it) could not be written."""
+
+
+def _write_config(cfg: dict, regenerate: bool = True) -> None:
+    """Persist config (JSON) and optionally regenerate the per-camera envs +
+    go2rtc config. Raises ConfigWriteError on any failure."""
     account = _account_of(cfg)
     cameras = _normalize_cameras(cfg.get("cameras"))
     out = dict(account)
@@ -282,37 +297,89 @@ def save_config(cfg: dict, regenerate: bool = True) -> bool:
     try:
         os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
         _atomic_write(CONFIG_PATH, json.dumps(out, indent=2))
-    except OSError:
-        return False
+    except OSError as e:
+        raise ConfigWriteError(f"cannot write {CONFIG_PATH}: {e.strerror or e}") from e
     if regenerate:
         try:
             generate(account, cameras)
-        except OSError:
-            return False
+        except OSError as e:
+            raise ConfigWriteError(f"config saved, but the generated stream files could "
+                                   f"not be written: {e.strerror or e}") from e
+
+
+def save_config(cfg: dict, regenerate: bool = True) -> bool:
+    """Persist `cfg` as-is (under the config lock) and regenerate the
+    per-camera envs + go2rtc config. Returns False if the config folder isn't
+    writable. For read-modify-write use config_transaction() instead: a
+    load_config()/save_config() pair can overwrite a concurrent writer."""
+    try:
+        with _config_file_lock():
+            _write_config(cfg, regenerate=regenerate)
+    except OSError:
+        return False
     return True
 
 
-def _config_file_lock():
-    """Cross-process lock for read-modify-write of the config (the stream
-    processes persist refreshed keys while the web UI may be saving too)."""
-    import contextlib
+# One lock for every config writer: a threading.RLock serialises the threads
+# of one process (the web UI's request handlers and background workers), and
+# fcntl.flock on <config dir>/.owlet.lock serialises processes (the stream
+# processes persisting refreshed keys, render_streams at boot, the web UI).
+# Nested use in one thread is re-entrant (the flock is taken only once).
+_CFG_RLOCK = threading.RLock()
+_CFG_DEPTH = threading.local()
 
-    @contextlib.contextmanager
-    def _cm():
+
+@contextlib.contextmanager
+def _config_file_lock():
+    with _CFG_RLOCK:
+        depth = getattr(_CFG_DEPTH, "n", 0)
         fd = None
-        try:
-            os.makedirs(CONFIG_DIR, exist_ok=True)
-            fd = os.open(os.path.join(CONFIG_DIR, ".owlet.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-            import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except (OSError, ImportError):
-            pass
+        if depth == 0:
+            try:
+                os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+                fd = os.open(os.path.join(CONFIG_DIR, ".owlet.lock"),
+                             os.O_RDWR | os.O_CREAT, 0o600)
+            except OSError as e:
+                raise ConfigWriteError(f"cannot lock the config in {CONFIG_DIR}: "
+                                       f"{e.strerror or e}") from e
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except ImportError:   # non-POSIX dev box: the RLock still applies
+                pass
+            except OSError as e:
+                os.close(fd)
+                raise ConfigWriteError(f"cannot lock the config: {e.strerror or e}") from e
+        _CFG_DEPTH.n = depth + 1
         try:
             yield
         finally:
+            _CFG_DEPTH.n = depth
             if fd is not None:
-                os.close(fd)
-    return _cm()
+                os.close(fd)   # releases the flock
+
+
+@contextlib.contextmanager
+def config_transaction(regenerate: bool = True):
+    """Read-modify-write the config under the shared config lock:
+
+        with config_transaction() as cfg:
+            cfg["cameras"].append(...)
+
+    Loads the config, yields the dict, and on a normal exit writes it back
+    atomically (unique temp file + os.replace) and, if `regenerate`, rewrites
+    the generated env/go2rtc files. If the body raises, nothing is written. If
+    the dict was not changed (and a config file already exists), nothing is
+    written either, so a lookup that ends in "no such camera" is free.
+    Write failures raise ConfigWriteError (an OSError)."""
+    with _config_file_lock():
+        cfg = load_config()
+        before = copy.deepcopy(cfg)
+        existed = os.path.exists(CONFIG_PATH)
+        yield cfg
+        if existed and cfg == before:
+            return
+        _write_config(cfg, regenerate=regenerate)
 
 
 def forget_account_requested(cfg: dict) -> bool:
@@ -339,9 +406,9 @@ def forget_account_if_keyed(cfg: dict) -> bool:
 def persist_camera_key(name: str, creds: dict) -> bool:
     """Store a freshly fetched UID/AuthKey/AV password for camera `name` so
     every later (re)start reuses it instead of logging in again. Applies
-    forget_account_if_keyed afterwards. Returns True if the config changed."""
-    with _config_file_lock():
-        cfg = load_config()
+    forget_account_if_keyed afterwards. Returns True if the config changed.
+    Raises ConfigWriteError if the change could not be persisted."""
+    with config_transaction(regenerate=True) as cfg:
         cam = find_camera(cfg, name)
         if cam is None or not creds.get("uid"):
             return False
@@ -352,10 +419,7 @@ def persist_camera_key(name: str, creds: dict) -> bool:
             if v and cam.get(k_cfg) != v:
                 cam[k_cfg] = v
                 changed = True
-        changed = forget_account_if_keyed(cfg) or changed
-        if changed:
-            save_config(cfg, regenerate=True)
-        return changed
+        return forget_account_if_keyed(cfg) or changed
 
 
 def camera_env(account: dict, cam: dict) -> dict[str, str]:

@@ -290,5 +290,45 @@ class TalkGateTests(WebappTestBase):
         self.assertFalse(os.path.isdir(os.path.join(self.dir, "sounds")))
 
 
+class ConfigWriteFailureTests(WebappTestBase):
+    """A config save that fails must come back as a JSON 500, never as ok."""
+
+    def setUp(self):
+        super().setUp()
+        cfg = cs.load_config()
+        cfg["cameras"] = [dict(cs.CAMERA_DEFAULTS, name="nursery", uid="U")]
+        cs.save_config(cfg)
+        p = mock.patch.object(cs, "_write_config",
+                              side_effect=cs.ConfigWriteError("cannot write: read-only"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_failing_saves_return_500(self):
+        calls = (
+            ("/api/config", {"region": "europe"}),
+            ("/api/mqtt", {"host": "broker.example.com"}),
+            ("/api/cameras", {"camera_dsn": "", "name": "hall"}),
+            ("/api/cameras/nursery", {"uid": "U2"}),
+            ("/api/volume/nursery", {"percent": 40}),
+            ("/api/diagnose", {"email": "user@example.com"}),
+        )
+        for url, body in calls:
+            with self.subTest(url=url), \
+                    mock.patch.object(webapp, "_start_camera_diagnose", lambda n: None), \
+                    mock.patch.object(webapp.threading, "Thread"):
+                r = self.c.post(url, headers=_auth(), json=body)
+                self.assertEqual(r.status_code, 500, r.get_data(as_text=True))
+                self.assertFalse(r.get_json()["ok"])
+                self.assertIn("could not save", r.get_json()["error"])
+        r = self.c.delete("/api/cameras/nursery", headers=_auth())
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual([c["name"] for c in cs.load_config()["cameras"]], ["nursery"])
+
+    def test_unknown_camera_is_404_without_a_write(self):
+        r = self.c.post("/api/cameras/nobody", headers=_auth(), json={"uid": "X"})
+        self.assertEqual(r.status_code, 404)
+        cs._write_config.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

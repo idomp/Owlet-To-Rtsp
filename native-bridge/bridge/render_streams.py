@@ -24,10 +24,17 @@ def main() -> int:
         return 0
     # OWLET_FORGET_ACCOUNT=1: drop stored account credentials at boot once every
     # camera has its key, so the env files below are written without them.
-    if cs.forget_account_if_keyed(cfg):
-        if cs.save_config(cfg, regenerate=False):
-            sys.stderr.write("[render] account email/password removed (OWLET_FORGET_ACCOUNT); "
-                             "running on the saved camera keys\n")
+    if cs.forget_account_requested(cfg):
+        try:
+            with cs.config_transaction(regenerate=False) as cfg:
+                forgot = cs.forget_account_if_keyed(cfg)
+            if forgot:
+                sys.stderr.write("[render] account email/password removed "
+                                 "(OWLET_FORGET_ACCOUNT); running on the saved camera keys\n")
+        except OSError as e:
+            sys.stderr.write(f"[render] could not save the config ({e}); account "
+                             "credentials kept\n")
+            cfg = cs.load_config()
     account = {k: cfg.get(k, cs.ACCOUNT_DEFAULTS[k]) for k in cs.ACCOUNT_FIELDS}
     cameras = cfg.get("cameras") or []
     try:

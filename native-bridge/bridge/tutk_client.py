@@ -1734,13 +1734,19 @@ def resolve_creds(refresh: bool = True) -> str:
 def _persist_key(creds: dict) -> None:
     """Save a fetched key so restarts/reconnects reuse it; if the config asks
     for it (OWLET_FORGET_ACCOUNT), the account credentials are blanked then and
-    this process stops being able to log in at all."""
+    this process stops being able to log in at all. A persistence failure is
+    logged as an error; the stream carries on with the in-memory key."""
     name = os.environ.get("OWLET_CAMERA_NAME", "")
     if not name:
         return
     try:
         import config_store as cs
         cs.persist_camera_key(name, creds)
+    except Exception as e:  # noqa: BLE001
+        log(f"ERROR: could not persist the refreshed key ({e}); continuing with the "
+            "in-memory key, the next restart will use the old saved key")
+        return
+    try:
         cfg = cs.load_config()
         if not (cfg.get("email") and cfg.get("password")):
             os.environ.pop("OWLET_EMAIL", None)
@@ -1748,7 +1754,7 @@ def _persist_key(creds: dict) -> None:
             log("account credentials removed from config (OWLET_FORGET_ACCOUNT) — "
                 "no further cloud logins")
     except Exception as e:  # noqa: BLE001
-        log(f"could not persist the refreshed key: {e}")
+        log(f"could not re-read the config after saving the key: {e}")
 
 
 _SHUTTING_DOWN = {"flag": False, "logged": False}

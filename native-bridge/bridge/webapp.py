@@ -79,9 +79,7 @@ TALK_ENABLED = os.environ.get("OWLET_TALK", "0") == "1"
 
 LOG: deque[str] = deque(maxlen=6000)
 STATE: dict = {"candidates": [], "devices": None, "busy": False, "cam_busy": set()}
-# Serialize config writes — the background per-camera diagnose threads and the
-# request handlers can otherwise interleave json.dump() and corrupt the file.
-_CFG_LOCK = threading.Lock()
+# Config writes are serialized by cs.config_transaction() (thread + process lock).
 
 
 def log(msg: str = "") -> None:
@@ -177,17 +175,22 @@ def _auth():
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
-def save_config(cfg: dict, regenerate: bool = True) -> bool:
-    with _CFG_LOCK:
-        ok = cs.save_config(cfg, regenerate=regenerate)
-    if ok:
-        return True
-    log(f"!! CANNOT WRITE {cs.CONFIG_DIR}. The mounted config folder isn't writable "
-        "by this container (it runs as uid 1000) — on the host, for the directory "
-        "mounted at /config (Unraid default /mnt/user/appdata/owlet-camera/config), run "
-        "`chown -R 1000:1000 <dir> && chmod -R u+rwX,go-rwx <dir>` and restart. "
-        "Never chmod 777: the folder holds your Owlet password and camera keys. Settings won't persist until then.")
-    return False
+# Every config change goes through cs.config_transaction(): it holds the
+# config lock shared with the stream processes (which persist refreshed keys)
+# across load -> modify -> save, so neither side overwrites the other.
+def _log_write_failure(e: Exception) -> None:
+    log(f"!! CANNOT WRITE {cs.CONFIG_DIR} ({e}). If the mounted config folder isn't "
+        "writable by this container (it runs as uid 1000), on the host, for the "
+        "directory mounted at /config (Unraid default /mnt/user/appdata/owlet-camera/config), "
+        "run `chown -R 1000:1000 <dir> && chmod -R u+rwX,go-rwx <dir>` and restart. "
+        "Never chmod 777: the folder holds your Owlet password and camera keys. "
+        "Settings won't persist until then.")
+
+
+def _write_failed(e: Exception):
+    """JSON 500 for a config change that could not be persisted."""
+    _log_write_failure(e)
+    return jsonify({"ok": False, "error": f"could not save the config: {e} (see log)"}), 500
 
 
 def _mask_pw(v: str) -> str:
@@ -207,21 +210,22 @@ def get_config():
 @app.post("/api/config")
 def post_config():
     incoming = request.json or {}
-    cfg = cs.load_config()
-    for k in cs.ACCOUNT_FIELDS:
-        if k not in incoming:
-            continue
-        val = incoming[k]
-        if k in ("password", "ui_pass") and val == "********":
-            continue
-        # let webrtc_candidate / ui_* be explicitly cleared to "" from the UI;
-        # other defaulted fields keep their saved value when blank
-        if (val is None or val == "") and (cfg.get(k) or "") != "" \
-                and k not in ("webrtc_candidate", "ui_user", "ui_pass"):
-            continue
-        cfg[k] = val
-    if not save_config(cfg):
-        return jsonify({"ok": False, "error": "config folder not writable — see log"}), 500
+    try:
+        with cs.config_transaction() as cfg:
+            for k in cs.ACCOUNT_FIELDS:
+                if k not in incoming:
+                    continue
+                val = incoming[k]
+                if k in ("password", "ui_pass") and val == "********":
+                    continue
+                # let webrtc_candidate / ui_* be explicitly cleared to "" from the UI;
+                # other defaulted fields keep their saved value when blank
+                if (val is None or val == "") and (cfg.get(k) or "") != "" \
+                        and k not in ("webrtc_candidate", "ui_user", "ui_pass"):
+                    continue
+                cfg[k] = val
+    except OSError as e:
+        return _write_failed(e)
     log("account settings saved.")
     restart_go2rtc()
     return jsonify({"ok": True})
@@ -244,20 +248,21 @@ def get_mqtt():
 @app.post("/api/mqtt")
 def post_mqtt():
     incoming = request.json or {}
-    cfg = cs.load_config()
-    m = dict(cs.MQTT_DEFAULTS)
-    m.update(cfg.get("mqtt") or {})
-    for k in cs.MQTT_FIELDS:
-        if k not in incoming:
-            continue
-        val = incoming[k]
-        if k == "password" and val == "********":
-            continue
-        m[k] = "1" if (k == "enabled" and val in (True, "1", "on", "true")) else \
-            ("" if (k == "enabled") else val)
-    cfg["mqtt"] = m
-    if not save_config(cfg, regenerate=False):
-        return jsonify({"ok": False, "error": "config folder not writable"}), 500
+    try:
+        with cs.config_transaction(regenerate=False) as cfg:
+            m = dict(cs.MQTT_DEFAULTS)
+            m.update(cfg.get("mqtt") or {})
+            for k in cs.MQTT_FIELDS:
+                if k not in incoming:
+                    continue
+                val = incoming[k]
+                if k == "password" and val == "********":
+                    continue
+                m[k] = "1" if (k == "enabled" and val in (True, "1", "on", "true")) else \
+                    ("" if (k == "enabled") else val)
+            cfg["mqtt"] = m
+    except OSError as e:
+        return _write_failed(e)
     log("Home Assistant (MQTT) settings saved — applying within a few seconds.")
     return jsonify({"ok": True})
 
@@ -388,19 +393,20 @@ def add_camera():
     body = request.json or {}
     dsn = (body.get("camera_dsn") or "").strip()
     name = body.get("name") or dsn or cs.DEFAULT_CAM_NAME
-    cfg = cs.load_config()
-    used = {c["name"] for c in cfg.get("cameras") or []}
-    slug = cs.slugify(name)
-    # de-dup the slug against existing cameras
-    final = slug
-    i = 2
-    while final in used:
-        final = f"{slug}-{i}"
-        i += 1
-    cam = dict(cs.CAMERA_DEFAULTS, name=final, camera_dsn=dsn)
-    cfg.setdefault("cameras", []).append(cam)
-    if not save_config(cfg):
-        return jsonify({"ok": False, "error": "config folder not writable — see log"}), 500
+    try:
+        with cs.config_transaction() as cfg:
+            used = {c["name"] for c in cfg.get("cameras") or []}
+            slug = cs.slugify(name)
+            # de-dup the slug against existing cameras
+            final = slug
+            i = 2
+            while final in used:
+                final = f"{slug}-{i}"
+                i += 1
+            cam = dict(cs.CAMERA_DEFAULTS, name=final, camera_dsn=dsn)
+            cfg.setdefault("cameras", []).append(cam)
+    except OSError as e:
+        return _write_failed(e)
     log(f"[{final}] camera added (DSN {dsn or '—'}).")
     if dsn:
         _start_camera_diagnose(final)
@@ -410,21 +416,23 @@ def add_camera():
 @app.post("/api/cameras/<name>")
 def update_camera(name):
     body = request.json or {}
-    cfg = cs.load_config()
-    cam = cs.find_camera(cfg, name)
-    if not cam:
-        return jsonify({"ok": False, "error": "no such camera"}), 404
-    for k in ("camera_dsn", "uid", "authkey", "av_password", "av_security_mode", "name"):
-        if k not in body:
-            continue
-        val = body[k]
-        if k in ("av_password", "authkey") and val == "********":
-            continue   # masked value echoed back by the UI = unchanged
-        if k == "name":
-            val = cs.slugify(val, cam["name"])
-        cam[k] = val
-    if not save_config(cfg):
-        return jsonify({"ok": False, "error": "config folder not writable — see log"}), 500
+    try:
+        with cs.config_transaction() as cfg:
+            cam = cs.find_camera(cfg, name)
+            if not cam:
+                return jsonify({"ok": False, "error": "no such camera"}), 404
+            for k in ("camera_dsn", "uid", "authkey", "av_password", "av_security_mode",
+                      "name"):
+                if k not in body:
+                    continue
+                val = body[k]
+                if k in ("av_password", "authkey") and val == "********":
+                    continue   # masked value echoed back by the UI = unchanged
+                if k == "name":
+                    val = cs.slugify(val, cam["name"])
+                cam[k] = val
+    except OSError as e:
+        return _write_failed(e)
     log(f"[{cam['name']}] settings saved.")
     restart_go2rtc()
     return jsonify({"ok": True, "name": cam["name"]})
@@ -432,13 +440,15 @@ def update_camera(name):
 
 @app.delete("/api/cameras/<name>")
 def delete_camera(name):
-    cfg = cs.load_config()
-    before = len(cfg.get("cameras") or [])
-    cfg["cameras"] = [c for c in cfg.get("cameras") or [] if c.get("name") != name]
-    if len(cfg["cameras"]) == before:
-        return jsonify({"ok": False, "error": "no such camera"}), 404
-    if not save_config(cfg):
-        return jsonify({"ok": False, "error": "config folder not writable — see log"}), 500
+    try:
+        with cs.config_transaction() as cfg:
+            before = len(cfg.get("cameras") or [])
+            kept = [c for c in cfg.get("cameras") or [] if c.get("name") != name]
+            if len(kept) == before:
+                return jsonify({"ok": False, "error": "no such camera"}), 404
+            cfg["cameras"] = kept
+    except OSError as e:
+        return _write_failed(e)
     # tidy up the camera's generated env + log (best effort)
     for p in (os.path.join(cs.CAM_DIR, f"{name}.env"),
               os.path.join(cs.CONFIG_DIR, f"tutk-{name}.log")):
@@ -485,17 +495,23 @@ def _camera_diagnose_worker(name: str):
         except Exception as e:  # noqa: BLE001
             log(f"[{name}] could not fetch camera key: {e}")
             return
-        # re-load in case the user edited meanwhile, then write our creds
-        cfg = cs.load_config()
-        cam = cs.find_camera(cfg, name)
-        if not cam:
-            return
-        cam["uid"] = creds["uid"]
-        cam["authkey"] = creds.get("authkey") or ""
-        if creds.get("av_password"):
-            cam["av_password"] = creds["av_password"]
-        forgot = cs.forget_account_if_keyed(cfg)
-        if save_config(cfg):
+        # write our creds into the CURRENT config (the user may have edited
+        # meanwhile, a stream process may have persisted a key)
+        try:
+            with cs.config_transaction() as cfg:
+                cam = cs.find_camera(cfg, name)
+                if not cam:
+                    return
+                cam["uid"] = creds["uid"]
+                cam["authkey"] = creds.get("authkey") or ""
+                if creds.get("av_password"):
+                    cam["av_password"] = creds["av_password"]
+                forgot = cs.forget_account_if_keyed(cfg)
+            saved = True
+        except OSError as e:
+            _log_write_failure(e)
+            saved = False
+        if saved:
             log(f"[{name}] camera key saved; (re)starting stream.")
             if forgot:
                 log("account email/password removed (OWLET_FORGET_ACCOUNT) — the bridge "
@@ -547,12 +563,15 @@ def _diagnose_worker(cfg: dict):
 def diagnose():
     if STATE["busy"]:
         return jsonify({"error": "already running"}), 409
-    cfg = cs.load_config()
     incoming = request.json or {}
-    for k in ("region", "email", "password"):
-        if incoming.get(k) and incoming[k] != "********":
-            cfg[k] = incoming[k]
-    save_config(cfg)
+    try:
+        with cs.config_transaction() as cfg:
+            for k in ("region", "email", "password"):
+                if incoming.get(k) and incoming[k] != "********":
+                    cfg[k] = incoming[k]
+        cfg = dict(cfg)
+    except OSError as e:
+        return _write_failed(e)
     LOG.clear()
     log("=== Owlet login test ===")
     threading.Thread(target=_diagnose_worker, args=(cfg,), daemon=True).start()
@@ -1497,11 +1516,13 @@ def set_volume(camera):
     except OSError as e:  # noqa: BLE001
         log(f"[vol] cannot write control file: {e}")
     # persist as the camera's default (applied on next (re)connect too)
-    cfg = cs.load_config()
-    cam = cs.find_camera(cfg, camera)
-    if cam is not None:
-        cam["spk_vol"] = str(pct)
-        save_config(cfg, regenerate=True)
+    try:
+        with cs.config_transaction(regenerate=True) as cfg:
+            cam = cs.find_camera(cfg, camera)
+            if cam is not None:
+                cam["spk_vol"] = str(pct)
+    except OSError as e:
+        return _write_failed(e)
     log(f"[vol] {camera}: speaker volume set to {pct}%")
     return jsonify({"ok": True, "percent": pct})
 
@@ -1515,7 +1536,11 @@ if __name__ == "__main__":
     # Seed defaults + generate an initial go2rtc config only when nothing exists
     # yet — never overwrite an existing config (it may hold camera creds).
     if not os.path.exists(cs.CONFIG_PATH):
-        if not save_config(cs.load_config()):
+        try:
+            with cs.config_transaction():   # writes the defaults: no file yet
+                pass
+        except OSError as e:
+            _log_write_failure(e)
             log("starting the UI anyway so you can fix the config-folder permission.")
     # Auth is mandatory: resolve (or generate) the credentials now and refuse to
     # serve at all if there are none — never an open control panel.
