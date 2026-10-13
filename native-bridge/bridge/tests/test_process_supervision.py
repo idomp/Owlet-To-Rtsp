@@ -130,10 +130,45 @@ class StopAllProducersTests(unittest.TestCase):
                 mock.patch.object(wd, "_gone", lambda pids, t: False):
             got = wd.stop_all_producers(names=["owlet"], timeout=0)
         self.assertEqual(got, [100, 101, 102])
-        # SIGTERM to the wrapper ONLY (it forwards one to tutk_client + ffmpeg);
-        # the children are only SIGKILLed if they outlive the timeout
-        self.assertEqual(sent, [([100], signal.SIGTERM),
+        # a wrapper without the OWLET_PRODUCER= marker has no forwarding trap,
+        # so its children get the SIGTERM directly; SIGKILL only for survivors
+        self.assertEqual(sent, [([100, 101, 102], signal.SIGTERM),
                                 ([100, 101, 102], signal.SIGKILL)])
+
+    @staticmethod
+    def _fallback_wrapper_cmd():
+        """The cmdline /proc shows for the baked-in fallback go2rtc.yaml exec."""
+        path = os.path.join(os.path.dirname(__file__), "..", "go2rtc.yaml")
+        with open(path) as f:
+            line = next(ln for ln in f if "exec:bash -c '" in ln and "tutk_client.py" in ln)
+        src = line.strip()[len("- exec:bash -c '"):]
+        return "bash -c " + src[:src.rindex("'")]
+
+    def test_fallback_wrapper_children_are_signalled_once(self):
+        cmd = self._fallback_wrapper_cmd()
+        self.assertNotIn(wd.PRODUCER_MARKER, cmd)
+        self.assertTrue(wd.is_producer_wrapper(cmd))
+        procs = [
+            (900, 1, cmd),
+            (901, 900, "python3 /app/tutk_client.py"),
+            (902, 900, "ffmpeg -f h264 -i - -c copy -f rtsp rtsp://127.0.0.1:8554/owlet"),
+        ]
+        got, sent = self._stop(procs, names=["owlet"])
+        self.assertEqual(got, [900, 901, 902])
+        self.assertEqual(sent, [([900, 901, 902], signal.SIGTERM)])
+
+    def test_marker_and_fallback_wrappers_together(self):
+        procs = [
+            (100, 1, self._wrapper_cmd("a")),
+            (101, 100, "python3 /app/tutk_client.py"),
+            (102, 100, "ffmpeg -f h264 -i - -f rtsp rtsp://127.0.0.1:8554/a"),
+            (900, 1, self._fallback_wrapper_cmd()),
+            (901, 900, "python3 /app/tutk_client.py"),
+        ]
+        got, sent = self._stop(procs, names=[])
+        self.assertEqual(got, [100, 101, 102, 900, 901])
+        # marker wrapper's children are left to its trap; the fallback's are not
+        self.assertEqual(sent, [([100, 900, 901], signal.SIGTERM)])
 
     def test_children_never_get_a_second_sigterm(self):
         procs = [

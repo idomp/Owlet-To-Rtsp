@@ -325,8 +325,9 @@ def stop_all_producers(names=None, timeout: float = 10.0, extra_names=()) -> lis
     ffmpeg) BEFORE go2rtc is restarted. go2rtc's /api/restart re-execs itself
     in place without stopping its exec sources, so their children used to be
     left running, still holding each camera's single P2P slot. SIGTERM the
-    wrappers only (their trap forwards it to tutk_client + ffmpeg), then
-    SIGKILL anything still alive after `timeout`. Returns the PIDs that were
+    wrappers (a marker wrapper's trap forwards it to tutk_client + ffmpeg;
+    the children of any other wrapper are signalled directly), then SIGKILL
+    anything still alive after `timeout`. Returns the PIDs that were
     targeted.
 
     Wrappers are found by their marker in the process table, NOT only by the
@@ -359,10 +360,18 @@ def stop_all_producers(names=None, timeout: float = 10.0, extra_names=()) -> lis
     allp = sorted(wrappers | kids | orphans)
     if not allp:
         return []
-    # SIGTERM goes to the wrappers ONLY: their trap forwards exactly one
-    # SIGTERM to tutk_client + ffmpeg. Signalling the children as well used to
-    # deliver a second SIGTERM into tutk_client's session teardown.
-    _kill(sorted(wrappers | orphans), signal.SIGTERM)
+    # Only a wrapper carrying the OWLET_PRODUCER= marker (the current
+    # config_store._exec_source) has the TERM trap that forwards exactly one
+    # SIGTERM to tutk_client + ffmpeg; signalling those children as well would
+    # deliver a second SIGTERM into tutk_client's session teardown. Any other
+    # wrapper -- the baked-in fallback go2rtc.yaml (used when /config is not
+    # writable or rendering fails) and older generated wrappers -- is a plain
+    # `bash -c '... | ffmpeg ...'` that forwards nothing, so its children get
+    # the SIGTERM directly or tutk_client would only die by the later SIGKILL,
+    # skipping its TUTK session release.
+    forwarding = {p for p, _pp, c in procs if p in wrappers and PRODUCER_MARKER in c}
+    direct = {p for p, pp, _c in procs if pp in wrappers - forwarding}
+    _kill(sorted(wrappers | orphans | direct), signal.SIGTERM)
     if not _gone(allp, timeout):
         _kill(allp, signal.SIGKILL)
         _gone(allp, 2)
