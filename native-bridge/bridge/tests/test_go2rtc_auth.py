@@ -126,6 +126,36 @@ class Go2rtcAuthTests(unittest.TestCase):
         self.assertEqual(_go2rtc_replace_env_vars("${A}|${B:d}|${C}|${D:}", {"A": "1"}),
                          "1|d|${C}|")
 
+    # Characters outside the Basic Multilingual Plane. json.dumps would emit
+    # them as a surrogate pair (👶), which the Go YAML parser rejects
+    # as an invalid escape; go2rtc then logs the error and runs on its defaults,
+    # i.e. an API with no authentication at all.
+    ASTRAL_CREDS = ("u\U00010400v", "p\U0001F476w")
+
+    def test_astral_unicode_renders_as_literal_utf8(self):
+        text = cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=self.ASTRAL_CREDS)
+        self.assertNotIn("\\ud", text.lower())
+        self.assertIn('username: "u\U00010400v"', text)
+        self.assertIn('password: "p\U0001F476w"', text)
+
+    @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+    def test_astral_unicode_round_trips_through_a_strict_yaml_parser(self):
+        text = cs.render_go2rtc([{"name": "owlet"}], candidate="", creds=self.ASTRAL_CREDS)
+        # libyaml (CSafeLoader) rejects surrogate escapes like go-yaml does;
+        # the pure-Python loader would silently return surrogate characters.
+        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+        d = yaml.load(text, Loader=loader)
+        for sec in ("api", "rtsp"):
+            self.assertEqual(d[sec]["username"], self.ASTRAL_CREDS[0])
+            self.assertEqual(d[sec]["password"], self.ASTRAL_CREDS[1])
+
+    def test_yaml_str_escapes_what_yaml_forbids_unescaped(self):
+        # DEL, the C1 controls (NEL excepted) and U+FFFE are not YAML-printable;
+        # the dollar sign is escaped for go2rtc; NEL and ordinary text stay as is.
+        self.assertEqual(cs._yaml_str("a\x7fb\x85c\x9fd￾e$"),
+                         '"a\\u007fb\x85c\\u009fd\\ufffee\\u0024"')
+        self.assertEqual(cs._yaml_str('q"b\\sé'), '"q\\"b\\\\sé"')
+
     def test_exec_sources_contain_no_hash(self):
         """go2rtc cuts an exec source at the first '#' to parse its options
         (internal/exec/exec.go); a stray '#' would truncate the command."""

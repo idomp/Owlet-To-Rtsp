@@ -53,7 +53,7 @@ def _atomic_write(path: str, text: str, mode: int | None = 0o600) -> None:
                 os.chmod(tmp, mode)   # umask may have narrowed it; never widened
             except OSError:
                 pass
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -800,7 +800,24 @@ def _yaml_str(v: str) -> str:
     evaluated at run time against the environment go2rtc's exec children
     inherit (exec.Command without Env), falling back to /tmp when TMPDIR is
     unset or empty -- the same rule as talk_fifo_path() and friends."""
-    return json.dumps(str(v)).replace("$", "\\u0024")
+    # ensure_ascii=False: json.dumps would otherwise emit characters outside the
+    # Basic Multilingual Plane as a surrogate pair (👶), which the Go
+    # YAML parser rejects as an invalid escape; go2rtc then logs the error and
+    # carries on with its defaults, i.e. an API with no authentication. Literal
+    # UTF-8 is valid YAML. What YAML does not allow unescaped (DEL, the C1
+    # controls except NEL, surrogates, U+FFFE/U+FFFF) is escaped by hand; the
+    # C0 controls, quotes and backslashes are already escaped by json.dumps.
+    out = []
+    for ch in json.dumps(str(v), ensure_ascii=False):
+        o = ord(ch)
+        if ch == "$":
+            out.append("\\u0024")
+        elif o == 0x7F or (0x80 <= o <= 0x9F and o != 0x85) \
+                or 0xD800 <= o <= 0xDFFF or o in (0xFFFE, 0xFFFF):
+            out.append("\\u%04x" % o)
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def go2rtc_credentials(create: bool = True) -> tuple[str, str]:
