@@ -37,6 +37,15 @@ SNAP = os.path.join(cs.VITALS_DIR, "snapshot.json")
 DISCOVERY_RECORD = os.path.join(cs.VITALS_DIR, "discovery.json")
 
 STATE_PREFIX = "owlet"
+# How long a retired discovery entry stays recorded (and its retirement
+# messages keep being re-sent) before it is pruned from the record.
+RETIRE_KEEP = 7 * 24 * 3600
+
+
+def _retired_at(entry: dict):
+    """The entry's retirement time, or None when it is not marked retired."""
+    v = entry.get("retired_at")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 # US/Imperial: report temperatures in °F.
 TEMP_KEYS = ("temperature", "skin_temperature")
@@ -147,51 +156,79 @@ class _Mqtt:
             self.retire_inactive()
 
     def _retire_pending_locked(self) -> bool:
-        """True while a recorded entity of an inactive source is still waiting
-        to be retired (caller holds the lock)."""
+        """True while retirement has work to do (caller holds the lock): a
+        recorded entity of an inactive source not yet retired, or a retired
+        entry that is still being re-sent or is due for pruning."""
         if self._active is None:
             return False
-        return any(e.get("source") not in self._active for e in self._record.values())
+        return any(e.get("source") not in self._active or _retired_at(e) is not None
+                   for e in self._record.values())
 
-    def retire_inactive(self) -> int:
+    def retire_inactive(self, now: float | None = None) -> int:
         """Remove every recorded entity whose source is not active: an EMPTY
         retained payload on its discovery topic (that is how Home Assistant
         deletes an MQTT-discovered entity), the retained state cleared, and
-        "offline" on its availability topic. Needs a live connection; entries
-        whose publish fails stay recorded and are retried on the next connect.
-        Returns how many discovery topics were cleared."""
+        "offline" on its availability topic.
+
+        The publishes use QoS 1 but are not waited on (this runs on paho's
+        network thread from _on_connect). An accepted publish is therefore not
+        proof of delivery, so the record entry is NOT deleted: it is marked
+        "retired_at" and the three messages are re-sent on every connect and
+        every poll cycle until the mark is RETIRE_KEEP (7 days) old, then the
+        entry is pruned. An entry with any of its three publishes refused stays
+        unmarked and is retried the same way. Needs a live connection (pruning
+        does not). Returns how many entries were newly marked retired."""
+        now = time.time() if now is None else now
+        newly = 0
         with self._lock:
-            if self._active is None or self.c is None or not self._connected:
+            if self._active is None:
                 return 0
-            gone = {t: e for t, e in self._record.items()
-                    if e.get("source") not in self._active}
-            if not gone:
-                return 0
-            cleared, done_extra = 0, set()
-            for topic, e in sorted(gone.items()):
-                if not self._try_pub(topic, ""):
-                    continue
-                for extra, payload in ((e.get("state"), ""), (e.get("availability"), "offline")):
-                    if extra and extra not in done_extra:
-                        self._try_pub(extra, payload)
-                        done_extra.add(extra)
-                        self._avail.pop(extra, None)
-                        self._last_state.pop(extra, None)
-                del self._record[topic]
-                self._discovery.pop(topic, None)
-                if e.get("uid"):
-                    self._announced.discard(e["uid"])
-                cleared += 1
-            if cleared:
+            expired = [t for t, e in self._record.items()
+                       if _retired_at(e) is not None
+                       and now - _retired_at(e) >= RETIRE_KEEP]
+            for t in expired:
+                del self._record[t]
+            dirty = bool(expired)
+            if self.c is not None and self._connected:
+                gone = {t: e for t, e in self._record.items()
+                        if e.get("source") not in self._active}
+                # state/availability topics an active, unretired entity still
+                # uses are never blanked or set offline
+                live = {x for e in self._record.values()
+                        if e.get("source") in self._active and _retired_at(e) is None
+                        for x in (e.get("state"), e.get("availability")) if x}
+                sent: dict[str, bool] = {}
+                for topic, e in sorted(gone.items()):
+                    ok = self._try_pub(topic, "")
+                    for extra, payload in ((e.get("state"), ""),
+                                           (e.get("availability"), "offline")):
+                        if not extra or extra in live:
+                            continue
+                        if extra not in sent:
+                            sent[extra] = self._try_pub(extra, payload)
+                            self._avail.pop(extra, None)
+                            self._last_state.pop(extra, None)
+                        ok = ok and sent[extra]
+                    if not ok or _retired_at(e) is not None:
+                        continue     # refused -> retried; already marked -> re-send only
+                    self._record[topic] = dict(e, retired_at=now)
+                    self._discovery.pop(topic, None)
+                    if e.get("uid"):
+                        self._announced.discard(e["uid"])
+                    newly += 1
+                    dirty = True
+            if dirty:
                 self._save_record()
-        if cleared:
-            self.log(f"[vitals] retired {cleared} MQTT entit{'y' if cleared == 1 else 'ies'} "
-                     "of disabled source(s) (empty retained discovery payload)")
-        return cleared
+        if newly:
+            self.log(f"[vitals] retired {newly} MQTT entit{'y' if newly == 1 else 'ies'} "
+                     "of disabled source(s) (empty retained discovery payload; re-sent "
+                     "on each connect and poll for 7 days)")
+        return newly
 
     def _try_pub(self, topic: str, payload: str) -> bool:
+        """QoS 1 retained publish, not waited on; False if paho refused it."""
         try:
-            info = self.c.publish(topic, payload, retain=True)
+            info = self.c.publish(topic, payload, qos=1, retain=True)
         except Exception:  # noqa: BLE001
             return False
         rc = getattr(info, "rc", 0)

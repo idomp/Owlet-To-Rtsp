@@ -67,19 +67,31 @@ Every discovery topic the bridge publishes is recorded in
 source that produced it (`cam` for the local camera sensors, `cloud` for the
 sock poller) and the device's state and availability topics.
 
-At startup and whenever the set of active sources changes, each recorded entity
-whose source is no longer running — typically every sock entity once
-`OWLET_VITALS_POLL` is back at `0` — is retired:
+On every broker connect and every poll cycle, each recorded entity whose source
+is no longer running — typically every sock entity once `OWLET_VITALS_POLL` is
+back at `0` — is retired:
 
 1. an **empty retained payload** on its discovery topic (this is how Home
    Assistant removes an MQTT-discovered entity, and it also clears the
    retained config from the broker);
 2. its retained state topic is cleared the same way;
 3. `offline` on its availability topic;
-4. it is dropped from the record.
+4. its record entry is marked `retired_at: <unix time>` (it is not deleted).
 
-Retirement waits for a live broker connection. If a publish fails the entry
-stays in the record and is retried on the next connect.
+The three retirement messages are published with QoS 1 and retained, without
+waiting for the broker's acknowledgement (they are sent from the MQTT network
+callback, which must not block). Because an accepted publish is not yet proof
+of delivery — a disconnect or a crash can lose it before it leaves the socket —
+a marked entry keeps being retired: all three messages are sent again on every
+connect and every poll cycle while the mark is younger than **7 days**. After
+that the entry is pruned from the record. A state or availability topic that an
+active entity still uses is never cleared or set `offline` by this.
+
+Retirement waits for a live broker connection (pruning does not). If any of
+the three publishes is refused by the client, the entry stays unmarked and is
+retried on the next poll cycle or connect. If the source is switched back on,
+the next discovery publish for that entity replaces the marked entry with a
+normal one.
 
 Without this, the sock's retained discovery configs and last readings stayed
 in the broker after the poller was switched off, and because the bridge-wide
