@@ -531,15 +531,35 @@ async function probeSensors(btn){
     setTimeout(loadVitals, 9000);
   });
 }
+/* Devices (cameras, socks) that have shown readings in this page. /api/vitals
+   only lists fresh readings, so a device that drops out of the response (or
+   comes back with none) must have its old values cleared, not left on screen. */
+const _vitalsSeen = new Map();   // dsn|name -> {kind, model, dsn}
+function vitalsKey(d){ return d.dsn || d.name || d.model || ""; }
+function hasReading(d){
+  return !!(d.sensors && Object.values(d.sensors).some(v=>v!==null&&v!==undefined&&v!==""));
+}
+function vitalsBadge(d){ return d.kind==="sock"?"🍼 Smart Sock":(d.kind==="cam"?"📷 Camera":"📦 Device"); }
 async function loadVitals(){
   let data; try { data = await (await fetch("/api/vitals")).json(); } catch(e){ return; }
   const wrap=$("vitals-wrap");
   const devs=(data&&data.devices)||[];
-  const withReadings=devs.filter(d=>d.sensors&&Object.values(d.sensors).some(v=>v!==null&&v!==undefined&&v!==""));
-  if(!withReadings.length){ return; }  // keep the empty hint until we have data
+  const withReadings=devs.filter(hasReading);
+  const freshKeys=new Set(withReadings.map(vitalsKey));
+  for (const d of devs) {
+    const k=vitalsKey(d);
+    if (k && (hasReading(d) || _vitalsSeen.has(k)))
+      _vitalsSeen.set(k, {kind:d.kind, model:d.model, dsn:d.dsn, name:d.name});
+  }
+  const gone=[..._vitalsSeen.entries()].filter(([k])=>!freshKeys.has(k)).map(([,d])=>d);
+  if(!withReadings.length && !gone.length){ return; }  // keep the empty hint until we have data
   // age from the NEWEST device ts (cam sensors update independently of the sock)
-  const newest = Math.max(...withReadings.map(d=>d.ts||data.ts||0), data.ts||0);
+  const newest = withReadings.length
+    ? Math.max(...withReadings.map(d=>d.ts||data.ts||0), data.ts||0) : 0;
   const age = newest ? Math.max(0, Math.round(Date.now()/1000 - newest)) : null;
+  const staleCards = gone.map(d=>`<div class="vcard glass"><div class="vhead">${vitalsBadge(d)}
+      <span class="vmodel">${esc(d.name||d.model||d.dsn||"")}</span></div>
+      <div class="vgrid"><span class="hint">no fresh readings</span></div></div>`).join("");
   wrap.innerHTML = withReadings.map(d=>{
     const keys=VITAL_ORDER.filter(k=>k in d.sensors);
     const chips=keys.map(k=>{
@@ -548,11 +568,10 @@ async function loadVitals(){
       return `<div class="vchip${dim}"><span class="vi">${m.icon}</span>
         <span class="vv">${fmtVital(k,v)}</span><span class="vl">${m.label}</span></div>`;
     }).join("");
-    const badge=d.kind==="sock"?"🍼 Smart Sock":(d.kind==="cam"?"📷 Camera":"📦 Device");
-    return `<div class="vcard glass"><div class="vhead">${badge}
+    return `<div class="vcard glass"><div class="vhead">${vitalsBadge(d)}
       <span class="vmodel">${esc(d.model||d.dsn||"")}</span></div>
       <div class="vgrid">${chips||"<span class='hint'>no recognized sensors</span>"}</div></div>`;
-  }).join("");
+  }).join("") + staleCards;
   if(age!==null){
     const stale = age>180 ? " — ⚠️ stale (sock may be off-base or asleep)" : "";
     wrap.innerHTML += `<div class="vts hint">updated ${age}s ago${stale}</div>`;
