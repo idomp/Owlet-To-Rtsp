@@ -317,7 +317,12 @@ def save_config(cfg: dict, regenerate: bool = True) -> bool:
     """Persist `cfg` as-is (under the config lock) and regenerate the
     per-camera envs + go2rtc config. Returns False if the config folder isn't
     writable. For read-modify-write use config_transaction() instead: a
-    load_config()/save_config() pair can overwrite a concurrent writer."""
+    load_config()/save_config() pair can overwrite a concurrent writer.
+    Raises RuntimeError inside an open config_transaction() in this thread:
+    the transaction's commit would overwrite what this wrote."""
+    if getattr(_CFG_DEPTH, "txn", None) is not None:
+        raise RuntimeError("save_config() inside config_transaction(): modify the "
+                           "transaction's dict instead")
     try:
         with _config_file_lock():
             _write_config(cfg, regenerate=regenerate)
@@ -379,12 +384,38 @@ def config_transaction(regenerate: bool = True):
     not rewritten, but with `regenerate` the generated files still are: a
     previous save may have committed the JSON and then failed to render them,
     and re-submitting the same settings must repair that, not report success
-    over stale files. Write failures raise ConfigWriteError (an OSError)."""
+    over stale files. Write failures raise ConfigWriteError (an OSError).
+
+    Nesting in one thread joins the open transaction: the inner block gets the
+    SAME dict and writes nothing itself; the outermost block commits every
+    change (and regenerates if any level asked for it). If an inner block
+    raises, its changes are rolled back in the shared dict before the
+    exception propagates, so an outer block that catches it commits only its
+    own changes."""
+    outer = getattr(_CFG_DEPTH, "txn", None)
+    if outer is not None:
+        cfg = outer["cfg"]
+        snapshot = copy.deepcopy(cfg)
+        try:
+            yield cfg
+        except BaseException:
+            cfg.clear()
+            cfg.update(snapshot)
+            raise
+        if regenerate:
+            outer["regenerate"] = True
+        return
     with _config_file_lock():
         cfg = load_config()
         before = copy.deepcopy(cfg)
         existed = os.path.exists(CONFIG_PATH)
-        yield cfg
+        state = {"cfg": cfg, "regenerate": regenerate}
+        _CFG_DEPTH.txn = state
+        try:
+            yield cfg
+        finally:
+            _CFG_DEPTH.txn = None
+        regenerate = state["regenerate"]
         if existed and cfg == before:
             if regenerate:
                 _regenerate(cfg)

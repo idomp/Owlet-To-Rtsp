@@ -113,11 +113,51 @@ class TransactionTests(TmpConfig):
         self.assertEqual(cs.find_camera(cfg, "nursery")["uid"], "NEWUID")
         self.assertEqual(cfg["mqtt"]["host"], "broker.example.com")
 
-    def test_nested_use_in_one_thread_does_not_deadlock(self):
+    def test_nested_transactions_keep_both_levels_changes(self):
         with cs.config_transaction(regenerate=False) as cfg:
             cfg["mqtt"]["prefix"] = "ha"
-            self.assertTrue(cs.save_config(cs.load_config(), regenerate=False))
-        self.assertEqual(cs.load_config()["mqtt"]["prefix"], "ha")
+            with cs.config_transaction(regenerate=False) as inner:
+                self.assertIs(inner, cfg)
+                inner["mqtt"]["host"] = "broker.example.com"
+            self.assertTrue(cs.persist_camera_key(
+                "nursery", {"uid": "NEWUID", "authkey": "NEWKEY12"}))
+            cfg["email"] = "user@example.com"      # outer keeps modifying after
+        saved = cs.load_config()
+        self.assertEqual(saved["mqtt"]["prefix"], "ha")
+        self.assertEqual(saved["mqtt"]["host"], "broker.example.com")
+        self.assertEqual(cs.find_camera(saved, "nursery")["uid"], "NEWUID")
+        self.assertEqual(saved["email"], "user@example.com")
+        # persist_camera_key asked for regeneration: the outer commit honours it
+        with open(os.path.join(cs.CAM_DIR, "nursery.env")) as fh:
+            self.assertIn("OWLET_UID='NEWUID'", fh.read())
+
+    def test_nested_transaction_writes_nothing_before_the_outer_commit(self):
+        before = cs.load_config()["email"]
+        with cs.config_transaction(regenerate=False):
+            with cs.config_transaction(regenerate=False) as inner:
+                inner["email"] = "user@example.com"
+            self.assertEqual(cs.load_config()["email"], before)
+        self.assertEqual(cs.load_config()["email"], "user@example.com")
+
+    def test_failed_inner_transaction_is_rolled_back_outer_kept(self):
+        with cs.config_transaction(regenerate=False) as cfg:
+            cfg["mqtt"]["prefix"] = "ha"
+            try:
+                with cs.config_transaction(regenerate=False) as inner:
+                    inner["cameras"] = []
+                    raise ValueError("abort inner")
+            except ValueError:
+                pass
+            self.assertEqual(len(cfg["cameras"]), 1)
+        saved = cs.load_config()
+        self.assertEqual(saved["mqtt"]["prefix"], "ha")
+        self.assertEqual([c["name"] for c in saved["cameras"]], ["nursery"])
+
+    def test_save_config_inside_a_transaction_raises(self):
+        with cs.config_transaction(regenerate=False):
+            with self.assertRaises(RuntimeError):
+                cs.save_config(cs.load_config(), regenerate=False)
+        self.assertTrue(cs.save_config(cs.load_config(), regenerate=False))
 
     def test_body_exception_writes_nothing(self):
         before = open(cs.CONFIG_PATH).read()
