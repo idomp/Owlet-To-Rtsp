@@ -621,6 +621,8 @@ def _vitals_worker(cfg: dict):
                 if len(sval) > 120:
                     sval = sval[:117] + "…"
                 log(f"        {name} = {sval}")
+        for d in snap:
+            d.setdefault("source", "cloud")   # /api/vitals keeps cloud cameras
         try:
             os.makedirs(VITALS_DIR, exist_ok=True)
             with open(VITALS_CACHE, "w") as f:
@@ -709,22 +711,35 @@ def vitals_latest():
     except Exception as e:  # noqa: BLE001
         payload = {"ts": None, "devices": [], "error": str(e)}
     # Cam room-sensors: always the freshly filtered sidecar data. The snapshot's
-    # copy of a camera is up to a poll cycle old (arbitrarily old when the
-    # publisher is off), so it is REPLACED, never merged with: a camera whose
-    # fields expired must lose them here, not keep its last values. A cached
-    # camera that is no longer configured (renamed or deleted) is dropped too.
-    cams = _cam_sensor_devices()
+    # copy of a LOCAL camera (tutk_client sidecar) is up to a poll cycle old
+    # (arbitrarily old when the publisher is off), so it is REPLACED, never
+    # merged with: a camera whose fields expired must lose them here, not keep
+    # its last values. A cached local camera that is no longer configured
+    # (renamed or deleted) is dropped too. Cameras reported by the Owlet cloud
+    # account (sock poller / discovery) are also kind "cam" but have no local
+    # sidecar; they are kept as cached.
+    cams = [dict(c, source="cam") for c in _cam_sensor_devices()]
     try:
         cs.camera_names()
         config_known = True
     except Exception:  # noqa: BLE001
         config_known = False
     fresh = {c["dsn"] for c in cams}
-    # With the camera list readable, every cached camera entry goes: the
+
+    def _local_cam(d: dict) -> bool:
+        if d.get("kind") != "cam":
+            return False
+        src = d.get("source")
+        if src is not None:          # vitals_poller tags every cached device
+            return src == "cam"
+        # untagged (older cache): only cloud devices carry Ayla properties
+        return "raw_props" not in d
+
+    # With the camera list readable, every cached local camera entry goes: the
     # configured ones are replaced by `cams`, the rest no longer exist. If the
     # config can't be read, only the cameras with fresh data are replaced.
     payload["devices"] = [d for d in payload.get("devices") or []
-                          if d.get("kind") != "cam"
+                          if not _local_cam(d)
                           or (not config_known and d.get("dsn") not in fresh)] + cams
     _convert_units(payload.get("devices", []), units)
     payload["units"] = "metric" if units == "metric" else "us"

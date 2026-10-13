@@ -100,6 +100,39 @@ class ApiVitalsTests(unittest.TestCase):
         self.assertIn("SOCK1", devs)
         self.assertEqual(devs["nursery"]["sensors"]["temperature"], 22)
 
+    def test_cloud_camera_in_the_snapshot_is_kept(self):
+        # the sock poller's account snapshot classifies an Owlet Cam as kind
+        # "cam" too; it has no local sidecar and must not vanish
+        self.cached({"dsn": "OCDPLACEHOLDER01", "name": "Owlet Cam", "kind": "cam",
+                     "source": "cloud", "sensors": {"temperature": 21},
+                     "raw_props": {}, "ts": self.now - 30},
+                    {"dsn": "nursery", "name": "nursery", "kind": "cam", "source": "cam",
+                     "sensors": {"temperature": 20}, "ts": self.now - 30})
+        self.sidecar("nursery", temperature=(22, 1))
+        devs = self.get()
+        self.assertEqual(devs["OCDPLACEHOLDER01"]["sensors"]["temperature"], 21)
+        self.assertEqual(devs["nursery"]["sensors"]["temperature"], 22)   # fresh, not cached
+
+    def test_untagged_cloud_camera_from_discovery_cache_is_kept(self):
+        # older caches (and the discovery button before it tagged entries) carry
+        # no "source"; a cloud device is recognized by its Ayla properties
+        self.cached({"dsn": "OCDPLACEHOLDER02", "name": "Owlet Cam", "kind": "cam",
+                     "sensors": {"humidity": 40}, "raw_props": {"SOME_PROP": 1},
+                     "ts": self.now - 30})
+        self.assertIn("OCDPLACEHOLDER02", self.get())
+
+    def test_stale_local_camera_entry_is_still_dropped(self):
+        # tagged local sidecar copies: an unconfigured one and a configured one
+        # whose fields all expired since the snapshot
+        self.cached({"dsn": "attic", "name": "attic", "kind": "cam", "source": "cam",
+                     "sensors": {"temperature": 19}, "ts": self.now - 30},
+                    {"dsn": "den", "name": "den", "kind": "cam", "source": "cam",
+                     "sensors": {"temperature": 21}, "ts": self.now - 30})
+        self.sidecar("den", temperature=(21, 3600))
+        devs = self.get()
+        self.assertNotIn("attic", devs)
+        self.assertNotIn("den", devs)
+
     def test_cloud_devices_in_the_snapshot_are_kept(self):
         self.cached({"dsn": "SOCK1", "name": "sock", "kind": "sock",
                      "sensors": {"heart_rate": 120}, "ts": self.now - 30})
