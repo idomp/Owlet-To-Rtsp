@@ -22,7 +22,10 @@ class FakeClient:
     def __init__(self, *a, **k):
         self.pubs = []
         self.on_connect = None
+        self.on_publish = None
         self.will = None
+        self._next_mid = 0
+        self.inflight = []      # (mid, topic) of QoS 1 publishes not yet acknowledged
 
     def username_pw_set(self, u, p):
         pass
@@ -43,8 +46,14 @@ class FakeClient:
         pass
 
     def publish(self, topic, payload=None, qos=0, retain=False):
+        """paho's signature: qos and retain may come as keywords in any order.
+        Returns an MQTTMessageInfo-like object with rc and mid."""
         self.pubs.append((topic, payload, retain))
         self.qos.append((topic, qos))
+        self._next_mid += 1
+        if qos:
+            self.inflight.append((self._next_mid, topic))
+        return types.SimpleNamespace(rc=0, mid=self._next_mid)
 
     @property
     def qos(self):
@@ -53,6 +62,15 @@ class FakeClient:
     # helpers
     def topics(self):
         return [t for t, _p, _r in self.pubs]
+
+    def ack(self, topics=None):
+        """Simulate the broker's PUBACK: paho calls on_publish(client,
+        userdata, mid) for every acknowledged QoS 1 message (all in flight, or
+        only those on `topics`)."""
+        done = [(m, t) for m, t in self.inflight if topics is None or t in topics]
+        self.inflight = [x for x in self.inflight if x not in done]
+        for mid, _t in done:
+            self.on_publish(self, None, mid)
 
 
 class SyncConnectClient(FakeClient):
@@ -133,14 +151,14 @@ class MqttReconnectTests(unittest.TestCase):
         flip = {"thread": None}
         real_publish = self.c.publish
 
-        def publish(topic, payload, retain=False):
+        def publish(topic, payload=None, qos=0, retain=False):
             if topic == avail and flip["thread"] is None:
                 # the poll thread runs mid-replay and flips the camera offline
                 t = threading.Thread(target=self.m.publish_device, args=(self.cam(),))
                 flip["thread"] = t
                 t.start()
                 t.join(0.3)     # blocks on the lock with the fix; finishes without it
-            real_publish(topic, payload, retain)
+            return real_publish(topic, payload, qos=qos, retain=retain)
 
         self.c.publish = publish
         self.c.on_connect(self.c, None, {}, 0)
@@ -198,8 +216,8 @@ class DiscoveryRecordTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.record = os.path.join(tmp.name, "vitals", "discovery.json")
 
-    def mqtt(self):
-        m = vp._Mqtt(lambda *_: None, record_path=self.record)
+    def mqtt(self, log=None):
+        m = vp._Mqtt(log or (lambda *_: None), record_path=self.record)
         m.ensure(SETTINGS)
         return m, m.c
 
@@ -270,57 +288,137 @@ class DiscoveryRecordTests(unittest.TestCase):
         e.update(extra)
         return e
 
-    def test_marked_entry_is_resent_on_the_next_connect_and_poll(self):
+    RETIRE_MSGS = ((SOCK_CFG, "", True), ("owlet/sock1/state", "", True),
+                   ("owlet/sock1/availability", "offline", True))
+
+    def test_unconfirmed_entry_is_resent_on_connect_and_once_per_interval(self):
         # a previous run marked it, then crashed before the packets left
         marked_at = time.time() - 3600
         self.write_record({self.SOCK_CFG: self.sock_entry(retired_at=marked_at)})
         m, c = self.mqtt()
         m.set_active_sources({"cam"})
         c.on_connect(c, None, {}, 0)
-        for msg in ((self.SOCK_CFG, "", True), ("owlet/sock1/state", "", True),
-                    ("owlet/sock1/availability", "offline", True)):
+        t0 = time.time()
+        for msg in self.RETIRE_MSGS:
             self.assertIn(msg, c.pubs)
         self.assertEqual(self.recorded()[self.SOCK_CFG]["retired_at"], marked_at)
+        # the following poll cycles do NOT re-send it every time ...
         c.pubs.clear()
-        m.set_active_sources({"cam"})          # next poll cycle
+        for dt in (15, 30, vp.RETIRE_RESEND - 1):
+            m.set_active_sources({"cam"}, now=t0 + dt)
+        self.assertEqual(c.pubs, [])
+        # ... only once the last send is RETIRE_RESEND old, and then once
+        m.set_active_sources({"cam"}, now=t0 + vp.RETIRE_RESEND + 1)
+        for msg in self.RETIRE_MSGS:
+            self.assertIn(msg, c.pubs)
+        c.pubs.clear()
+        m.set_active_sources({"cam"}, now=t0 + vp.RETIRE_RESEND + 16)
+        self.assertEqual(c.pubs, [])
+        # a reconnect re-sends it regardless of the interval
+        c.on_connect(c, None, {}, 0)
         self.assertIn((self.SOCK_CFG, "", True), c.pubs)
+        self.assertIn(self.SOCK_CFG, self.recorded())
 
-    def test_marked_entry_older_than_seven_days_is_pruned(self):
+    def test_acknowledged_entry_is_dropped_and_not_resent(self):
+        self.write_record({self.SOCK_CFG: self.sock_entry()})
+        m, c = self.mqtt()
+        m.set_active_sources({"cam"})
+        c.on_connect(c, None, {}, 0)
+        self.assertIn("retired_at", self.recorded()[self.SOCK_CFG])
+        c.ack()                                # PUBACK for all three messages
+        m.set_active_sources({"cam"})          # next poll applies them
+        self.assertEqual(self.recorded(), {})
+        c.pubs.clear()
+        c.on_connect(c, None, {}, 0)           # next connect
+        m.set_active_sources({"cam"}, now=time.time() + vp.RETIRE_RESEND + 1)
+        self.assertNotIn(self.SOCK_CFG, c.topics())
+        self.assertNotIn("owlet/sock1/state", c.topics())
+        # and a restart does not bring it back either
+        m2, c2 = self.mqtt()
+        m2.set_active_sources({"cam"})
+        c2.on_connect(c2, None, {}, 0)
+        self.assertNotIn(self.SOCK_CFG, c2.topics())
+
+    def test_partial_acknowledgement_does_not_confirm(self):
+        self.write_record({self.SOCK_CFG: self.sock_entry()})
+        m, c = self.mqtt()
+        m.set_active_sources({"cam"})
+        c.on_connect(c, None, {}, 0)
+        c.ack(topics={self.SOCK_CFG, "owlet/sock1/state"})   # availability lost
+        m.set_active_sources({"cam"})
+        self.assertIn(self.SOCK_CFG, self.recorded())
+        self.assertNotIn("confirmed_at", self.recorded()[self.SOCK_CFG])
+        c.ack()                                              # finally acknowledged
+        m.set_active_sources({"cam"})
+        self.assertEqual(self.recorded(), {})
+
+    def test_on_publish_callback_does_not_take_the_lock(self):
+        m, c = self.mqtt()
+        self.assertIsNotNone(c.on_publish, "must register an on_publish handler")
+        with m._lock:                          # a publisher holds the lock ...
+            c.on_publish(c, None, 42)          # ... the PUBACK must not wait for it
+        self.assertIn(42, m._acks)
+
+    def test_unconfirmed_entry_older_than_seven_days_is_pruned_with_a_warning(self):
         old = time.time() - vp.RETIRE_KEEP - 60
         self.write_record({self.SOCK_CFG: self.sock_entry(retired_at=old)})
-        m, c = self.mqtt()
+        logs = []
+        m, c = self.mqtt(log=logs.append)
         m.set_active_sources({"cam"})
         c.on_connect(c, None, {}, 0)
         self.assertNotIn(self.SOCK_CFG, c.topics())
         self.assertEqual(self.recorded(), {})
+        warn = [line for line in logs if "WARNING" in line]
+        self.assertEqual(len(warn), 1)
+        self.assertIn(self.SOCK_CFG, warn[0])
 
     def test_failed_state_clear_keeps_the_entry_unmarked(self):
         self.write_record({self.SOCK_CFG: self.sock_entry()})
         m, c = self.mqtt()
         real = c.publish
 
-        def publish(topic, payload=None, qos=0, retain=False):
-            real(topic, payload, qos=qos, retain=retain)
-            return types.SimpleNamespace(rc=4 if topic == "owlet/sock1/state" else 0)
+        def publish(topic, payload=None, retain=False, qos=0):   # keywords, other order
+            info = real(topic, payload, retain=retain, qos=qos)
+            if topic == "owlet/sock1/state":
+                info.rc = 4
+            return info
         c.publish = publish
         m.set_active_sources({"cam"})
         c.on_connect(c, None, {}, 0)
         self.assertIn((self.SOCK_CFG, "", True), c.pubs)        # discovery clear went out
+        self.assertNotIn("retired_at", self.recorded()[self.SOCK_CFG])
+        # acknowledging what did go out cannot confirm an unmarked entry
+        c.ack()
+        m.set_active_sources({"cam"})
+        self.assertIn(self.SOCK_CFG, self.recorded())
         self.assertNotIn("retired_at", self.recorded()[self.SOCK_CFG])
         # retried on the next cycle once the publish is accepted
         c.publish = real
         m.set_active_sources({"cam"})
         self.assertIn("retired_at", self.recorded()[self.SOCK_CFG])
 
-    def test_failed_publish_keeps_the_entry_for_the_next_connect(self):
+    def test_failed_clear_stays_unmarked_and_is_retried_until_confirmed(self):
         m, c = self.mqtt()
         c.on_connect(c, None, {}, 0)
         m.publish_device(self.sock())
         m2, c2 = self.mqtt()
-        c2.publish = lambda *a, **k: types.SimpleNamespace(rc=4)   # MQTT_ERR_NO_CONN
+        real = c2.publish
+        c2.publish = lambda *a, **k: types.SimpleNamespace(rc=4, mid=None)  # MQTT_ERR_NO_CONN
         c2.on_connect(c2, None, {}, 0)
         m2.set_active_sources({"cam"})
+        # refused: kept, and NOT marked retired
         self.assertIn(self.SOCK_CFG, self.recorded())
+        self.assertNotIn("retired_at", self.recorded()[self.SOCK_CFG])
+        # retried on the next poll cycle; accepted this time -> marked
+        c2.publish = real
+        m2.set_active_sources({"cam"})
+        for msg in self.RETIRE_MSGS:
+            self.assertIn(msg, c2.pubs)
+        self.assertIn("retired_at", self.recorded()[self.SOCK_CFG])
+        # the broker acknowledges all three -> confirmed and dropped
+        c2.ack()
+        m2.set_active_sources({"cam"})
+        self.assertNotIn(self.SOCK_CFG, self.recorded())
 
     def test_immediate_connack_still_retires(self):
         m, c = self.mqtt()

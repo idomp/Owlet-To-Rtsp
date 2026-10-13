@@ -76,22 +76,37 @@ back at `0` — is retired:
    retained config from the broker);
 2. its retained state topic is cleared the same way;
 3. `offline` on its availability topic;
-4. its record entry is marked `retired_at: <unix time>` (it is not deleted).
+4. its record entry is marked `retired_at: <unix time>` (it is not deleted
+   yet).
 
 The three retirement messages are published with QoS 1 and retained, without
-waiting for the broker's acknowledgement (they are sent from the MQTT network
-callback, which must not block). Because an accepted publish is not yet proof
-of delivery — a disconnect or a crash can lose it before it leaves the socket —
-a marked entry keeps being retired: all three messages are sent again on every
-connect and every poll cycle while the mark is younger than **7 days**. After
-that the entry is pruned from the record. A state or availability topic that an
-active entity still uses is never cleared or set `offline` by this.
+waiting for the broker (they are also sent from the MQTT network callback,
+which must not block). An accepted publish is not yet proof of delivery — a
+disconnect or a crash can lose it before it leaves the socket — so the bridge
+keeps each message's id and waits for the broker's acknowledgement (the QoS 1
+`PUBACK`, reported by the MQTT client's publish callback):
 
-Retirement waits for a live broker connection (pruning does not). If any of
-the three publishes is refused by the client, the entry stays unmarked and is
-retried on the next poll cycle or connect. If the source is switched back on,
-the next discovery publish for that entity replaces the marked entry with a
-normal one.
+* once **all three** messages of an entry are acknowledged, the entry is
+  confirmed and dropped from the record on the next write; it is never sent
+  again;
+* an entry that is marked but not yet confirmed is sent again on every broker
+  connect and, between connects, **at most once every 10 minutes** — not on
+  every poll cycle;
+* an entry still unconfirmed **7 days** after it was marked is pruned from the
+  record with a log line
+  `WARNING: the broker never acknowledged the retirement of MQTT discovery topic <topic> …`.
+  The bridge stops trying at that point; if Home Assistant still shows the
+  entity, delete it by hand (see below).
+
+A state or availability topic that an active entity still uses is never
+cleared or set `offline` by this. Acknowledgements are tracked in memory only:
+after a restart, an entry still marked in the record is sent again on the
+first connect and confirmed by that send's acknowledgements.
+
+Sending needs a live broker connection (pruning does not). If any of the three
+publishes is refused by the client, the entry stays unmarked and is retried on
+the next poll cycle or connect. If the source is switched back on, the next
+discovery publish for that entity replaces the marked entry with a normal one.
 
 Without this, the sock's retained discovery configs and last readings stayed
 in the broker after the poller was switched off, and because the bridge-wide

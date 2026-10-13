@@ -24,6 +24,7 @@ Two independent sources:
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import threading
@@ -37,9 +38,13 @@ SNAP = os.path.join(cs.VITALS_DIR, "snapshot.json")
 DISCOVERY_RECORD = os.path.join(cs.VITALS_DIR, "discovery.json")
 
 STATE_PREFIX = "owlet"
-# How long a retired discovery entry stays recorded (and its retirement
-# messages keep being re-sent) before it is pruned from the record.
+# How long a retired discovery entry whose retirement the broker never
+# acknowledged stays recorded (and keeps being re-sent) before it is pruned
+# from the record with a warning.
 RETIRE_KEEP = 7 * 24 * 3600
+# While polling, an unacknowledged retirement is re-sent at most this often
+# (every broker connect re-sends it as well).
+RETIRE_RESEND = 10 * 60
 
 
 def _retired_at(entry: dict):
@@ -116,6 +121,13 @@ class _Mqtt:
         self._record: dict[str, dict] = self._load_record()
         self._active: set[str] | None = None   # sources publishing this run
         self._connected = False
+        # Delivery evidence for retirement messages. _on_publish (paho's
+        # network thread) only appends the acknowledged mid to _acks; the
+        # rest is applied under self._lock by _apply_acks_locked.
+        self._acks: collections.deque = collections.deque()
+        self._mid_topic: dict[int, str] = {}   # retirement mid -> its topic
+        self._acked_topics: set[str] = set()   # retirement topics with a PUBACK
+        self._sent_at: dict[str, float] = {}   # config topic -> last retirement send
 
     # -- discovery record + retirement -------------------------------------- #
     def _load_record(self) -> dict:
@@ -131,8 +143,13 @@ class _Mqtt:
                 if isinstance(t, str) and isinstance(e, dict) and e.get("source")}
 
     def _save_record(self) -> None:
-        """Atomic rewrite of the record (caller holds the lock). Best effort: a
-        read-only /config only loses the ability to retire entities later."""
+        """Atomic rewrite of the record (caller holds the lock). Entries whose
+        retirement the broker acknowledged ("confirmed_at") are dropped first.
+        Best effort: a read-only /config only loses the ability to retire
+        entities later."""
+        for t in [t for t, e in self._record.items() if e.get("confirmed_at") is not None]:
+            del self._record[t]
+            self._sent_at.pop(t, None)
         try:
             os.makedirs(os.path.dirname(self.record_path) or ".", mode=0o700, exist_ok=True)
             cs._atomic_write(self.record_path,  # noqa: SLF001
@@ -141,77 +158,131 @@ class _Mqtt:
         except OSError as e:
             self.log(f"[vitals] discovery record write failed: {e}")
 
-    def set_active_sources(self, sources) -> None:
+    def set_active_sources(self, sources, now: float | None = None) -> None:
         """Tell the publisher which sources run this cycle ("cam", "cloud").
         Called every poll cycle: whenever an entity recorded for a source that
         is no longer active is still waiting to be retired, retirement is
         retried here -- not only when the set changes, so a pass that could not
         run (no connection yet, a failed publish) is picked up on the next
-        cycle instead of waiting for the next reconnect."""
+        cycle instead of waiting for the next reconnect. A retirement that was
+        sent but not yet acknowledged is only re-sent once per RETIRE_RESEND
+        from here."""
         sources = set(sources)
         with self._lock:
             self._active = sources
             pending = self._retire_pending_locked()
         if pending:
-            self.retire_inactive()
+            self.retire_inactive(now=now, resend=False)
 
     def _retire_pending_locked(self) -> bool:
         """True while retirement has work to do (caller holds the lock): a
         recorded entity of an inactive source not yet retired, or a retired
-        entry that is still being re-sent or is due for pruning."""
+        entry that still waits for its acknowledgement (or for pruning)."""
         if self._active is None:
             return False
         return any(e.get("source") not in self._active or _retired_at(e) is not None
                    for e in self._record.values())
 
-    def retire_inactive(self, now: float | None = None) -> int:
+    def _live_topics_locked(self) -> set[str]:
+        """State/availability topics an active, unretired entity still uses;
+        those are never blanked or set offline by a retirement."""
+        return {x for e in self._record.values()
+                if e.get("source") in self._active and _retired_at(e) is None
+                for x in (e.get("state"), e.get("availability")) if x}
+
+    @staticmethod
+    def _retire_extras(e: dict, live: set[str]) -> list[tuple[str, str]]:
+        """The state clear + "offline" an entry's retirement sends besides the
+        empty discovery payload (topics still in use are left alone)."""
+        return [(x, p) for x, p in ((e.get("state"), ""), (e.get("availability"), "offline"))
+                if x and x not in live]
+
+    def _apply_acks_locked(self, now: float) -> bool:
+        """Turn the PUBACKs queued by _on_publish into delivery evidence and
+        mark every retired entry whose retirement messages have ALL been
+        acknowledged "confirmed_at" (dropped on the next record write).
+        Caller holds the lock. Returns True if an entry was confirmed."""
+        while True:
+            try:
+                mid = self._acks.popleft()
+            except IndexError:
+                break
+            topic = self._mid_topic.pop(mid, None)
+            if topic is not None:
+                self._acked_topics.add(topic)
+        live = self._live_topics_locked()
+        confirmed = 0
+        for topic, e in list(self._record.items()):
+            if _retired_at(e) is None or e.get("confirmed_at") is not None:
+                continue
+            need = {topic} | {x for x, _p in self._retire_extras(e, live)}
+            if need <= self._acked_topics:
+                self._record[topic] = dict(e, confirmed_at=now)
+                confirmed += 1
+        if confirmed:
+            self.log(f"[vitals] broker acknowledged the retirement of {confirmed} MQTT "
+                     f"entit{'y' if confirmed == 1 else 'ies'}; dropped from the record")
+        return bool(confirmed)
+
+    def retire_inactive(self, now: float | None = None, resend: bool = True) -> int:
         """Remove every recorded entity whose source is not active: an EMPTY
         retained payload on its discovery topic (that is how Home Assistant
         deletes an MQTT-discovered entity), the retained state cleared, and
         "offline" on its availability topic.
 
         The publishes use QoS 1 but are not waited on (this runs on paho's
-        network thread from _on_connect). An accepted publish is therefore not
-        proof of delivery, so the record entry is NOT deleted: it is marked
-        "retired_at" and the three messages are re-sent on every connect and
-        every poll cycle until the mark is RETIRE_KEEP (7 days) old, then the
-        entry is pruned. An entry with any of its three publishes refused stays
-        unmarked and is retried the same way. Needs a live connection (pruning
-        does not). Returns how many entries were newly marked retired."""
+        network thread from _on_connect). Once all three are accepted the
+        entry is marked "retired_at"; it is "confirmed_at" (and dropped from
+        the record) only when the broker has acknowledged every one of them
+        (PUBACK, seen through _on_publish). Until then it is re-sent on every
+        connect (resend=True) and, during polling (resend=False), at most once
+        per RETIRE_RESEND. An entry still unconfirmed after RETIRE_KEEP (7
+        days) is pruned with a warning naming its topic. An entry with any of
+        its three publishes refused stays unmarked and is retried on every
+        connect and poll cycle. Needs a live connection (acknowledgements and
+        pruning do not). Returns how many entries were newly marked retired."""
         now = time.time() if now is None else now
         newly = 0
         with self._lock:
             if self._active is None:
                 return 0
+            dirty = self._apply_acks_locked(now)
             expired = [t for t, e in self._record.items()
-                       if _retired_at(e) is not None
+                       if _retired_at(e) is not None and e.get("confirmed_at") is None
                        and now - _retired_at(e) >= RETIRE_KEEP]
             for t in expired:
                 del self._record[t]
-            dirty = bool(expired)
+                self._sent_at.pop(t, None)
+            dirty = dirty or bool(expired)
             if self.c is not None and self._connected:
+                live = self._live_topics_locked()
+                # unmarked entries every pass; marked, unconfirmed ones on a
+                # connect or once their last send is RETIRE_RESEND old
                 gone = {t: e for t, e in self._record.items()
-                        if e.get("source") not in self._active}
-                # state/availability topics an active, unretired entity still
-                # uses are never blanked or set offline
-                live = {x for e in self._record.values()
-                        if e.get("source") in self._active and _retired_at(e) is None
-                        for x in (e.get("state"), e.get("availability")) if x}
+                        if e.get("source") not in self._active
+                        and e.get("confirmed_at") is None
+                        and (resend or _retired_at(e) is None
+                             or now - self._sent_at.get(t, 0.0) >= RETIRE_RESEND)}
                 sent: dict[str, bool] = {}
                 for topic, e in sorted(gone.items()):
                     ok = self._try_pub(topic, "")
-                    for extra, payload in ((e.get("state"), ""),
-                                           (e.get("availability"), "offline")):
-                        if not extra or extra in live:
-                            continue
+                    extras = self._retire_extras(e, live)
+                    for extra, payload in extras:
                         if extra not in sent:
                             sent[extra] = self._try_pub(extra, payload)
                             self._avail.pop(extra, None)
                             self._last_state.pop(extra, None)
                         ok = ok and sent[extra]
-                    if not ok or _retired_at(e) is not None:
-                        continue     # refused -> retried; already marked -> re-send only
+                    if _retired_at(e) is not None:
+                        self._sent_at[topic] = now     # re-send of a marked entry
+                        continue
+                    if not ok:
+                        continue                       # refused -> stays unmarked, retried
+                    # acknowledgements older than this pass prove nothing
+                    # about it (the queued PUBACKs of this pass come later)
+                    self._acked_topics.difference_update({topic} | {x for x, _p in extras})
                     self._record[topic] = dict(e, retired_at=now)
+                    self._sent_at[topic] = now
                     self._discovery.pop(topic, None)
                     if e.get("uid"):
                         self._announced.discard(e["uid"])
@@ -219,20 +290,44 @@ class _Mqtt:
                     dirty = True
             if dirty:
                 self._save_record()
+        for t in expired:
+            self.log(f"[vitals] WARNING: the broker never acknowledged the retirement of "
+                     f"MQTT discovery topic {t} within 7 days; dropped it from the record. "
+                     "If Home Assistant still shows that entity, clear the retained topic "
+                     "by hand (see docs/mqtt.md).")
         if newly:
             self.log(f"[vitals] retired {newly} MQTT entit{'y' if newly == 1 else 'ies'} "
                      "of disabled source(s) (empty retained discovery payload; re-sent "
-                     "on each connect and poll for 7 days)")
+                     "until the broker acknowledges it)")
         return newly
 
     def _try_pub(self, topic: str, payload: str) -> bool:
-        """QoS 1 retained publish, not waited on; False if paho refused it."""
+        """QoS 1 retained publish, not waited on; False if paho refused it.
+        Caller holds the lock. The message id is remembered so its PUBACK
+        (_on_publish) can be matched to the topic; a newer send on the same
+        topic replaces the older id."""
         try:
             info = self.c.publish(topic, payload, qos=1, retain=True)
         except Exception:  # noqa: BLE001
             return False
         rc = getattr(info, "rc", 0)
-        return not rc
+        if rc:
+            return False
+        mid = getattr(info, "mid", None)
+        if isinstance(mid, int) and not isinstance(mid, bool):
+            for old in [m for m, t in self._mid_topic.items() if t == topic]:
+                del self._mid_topic[old]
+            self._mid_topic[mid] = topic
+        return True
+
+    def _on_publish(self, _client, _userdata, mid, *_a):
+        """paho callback (network thread) once a publish completes -- for QoS 1
+        that is the broker's PUBACK. It only queues the message id and never
+        takes self._lock: paho can hold its own message lock around this call
+        while another thread holds self._lock inside publish() waiting for
+        that same paho lock. The ids are matched on the next retirement pass
+        (every poll cycle while one is pending, and every connect)."""
+        self._acks.append(mid)
 
     def ensure(self, s: dict):
         """Connect/disconnect/reconnect to match settings dict `s`. Retries each
@@ -252,6 +347,11 @@ class _Mqtt:
                 self._discovery.clear()
                 self._avail.clear()
                 self._last_state.clear()
+                # message ids and acknowledgements belong to the old client
+                # (and possibly another broker)
+                self._acks.clear()
+                self._mid_topic.clear()
+                self._acked_topics.clear()
             self._key = key
         if not s.get("enabled") or not s.get("host"):
             return
@@ -272,6 +372,7 @@ class _Mqtt:
             c.will_set(f"{STATE_PREFIX}/bridge/status", "offline", retain=True)
             c.on_connect = self._on_connect
             c.on_disconnect = self._on_disconnect
+            c.on_publish = self._on_publish
             c.connect(s["host"], int(s.get("port") or 1883), 60)
             # Assigned BEFORE the network loop starts: a fast CONNACK runs
             # _on_connect on paho's thread, and its retirement pass needs
