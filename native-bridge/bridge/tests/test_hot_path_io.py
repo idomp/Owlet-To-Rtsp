@@ -21,7 +21,8 @@ BRIDGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BRIDGE)
 import tutk_client as tc  # noqa: E402
 
-WAIT = 5   # generous: these are "does it ever return" checks, not timings
+WAIT = 5     # generous: these are "does it ever return" checks, not timings
+HOLD = 60    # stalled fakes stay stalled until the test releases them
 
 
 def _in_thread(fn) -> threading.Event:
@@ -73,7 +74,7 @@ class SensorWriterTests(unittest.TestCase):
             if dst == self.path:
                 replaces.append(1)
                 entered.set()
-                self.gate.wait(WAIT)
+                self.gate.wait(HOLD)
             return real_replace(src, dst)
 
         with mock.patch("os.replace", stalled_replace):
@@ -108,7 +109,7 @@ class NonBlockingLogTests(unittest.TestCase):
 
         def sink(text):
             self.entered.set()
-            self.gate.wait(WAIT)
+            self.gate.wait(HOLD)
             self.out.append(text)
 
         for name, val in (("_LOG_Q", self.q), ("_LOG_WRITER", [None]),
@@ -135,7 +136,7 @@ class NonBlockingLogTests(unittest.TestCase):
         self.assertTrue(tc._log_drain(WAIT))
         lines = [ln.split(" [tutk] ", 1)[1] for ln in "".join(self.out).splitlines()]
         self.assertEqual(lines, ["line 0",
-                                 "[log] 6 line(s) dropped while the log was not draining",
+                                 "[log] 6 record(s) dropped while the log was not draining",
                                  "line 1", "line 2", "line 3"])
 
     def test_drain_is_bounded_when_the_sink_is_wedged(self):
@@ -145,15 +146,15 @@ class NonBlockingLogTests(unittest.TestCase):
         self.assertFalse(tc._log_drain(0.3))
         self.assertLess(time.monotonic() - t0, 3)
 
-    def test_stderr_writes_from_other_modules_are_queued_whole_lines(self):
+    def test_stderr_writes_from_other_modules_are_queued(self):
         tc.log("first")
         self.assertTrue(self.entered.wait(WAIT))
         err = tc._QueuedStderr()
-        done = _in_thread(lambda: (print("login guard:", "warning", file=err), err.flush()))
+        done = _in_thread(lambda: (print("login guard: warning", file=err), err.flush()))
         self.assertTrue(done.wait(WAIT), "print to the queued stderr blocked")
         self.gate.set()
         self.assertTrue(tc._log_drain(WAIT))
-        self.assertEqual(self.out[-1], "login guard: warning\n")
+        self.assertEqual("".join(self.out[1:]), "login guard: warning\n")
 
 
 class StallSupervisorTests(unittest.TestCase):
@@ -213,7 +214,7 @@ class FirstFrameGuardReportTests(unittest.TestCase):
 
         def stalled_record(fp):
             entered.set()
-            self.gate.wait(WAIT)
+            self.gate.wait(HOLD)
             seen.append(fp)
             return False
 
@@ -226,6 +227,28 @@ class FirstFrameGuardReportTests(unittest.TestCase):
             self.gate.set()
             self.assertTrue(tc._guard_drain(WAIT))
         self.assertEqual(seen, [expected])
+
+    def test_delayed_report_keeps_the_key_of_the_session_that_had_video(self):
+        import login_guard
+        entered = threading.Event()
+        seen = []
+
+        def stalled_record(fp):
+            entered.set()
+            self.gate.wait(HOLD)
+            seen.append(fp)
+            return False
+
+        with mock.patch.object(tc, "UID", "UID-A"), mock.patch.object(tc, "AUTHKEY", "k-a"), \
+                mock.patch.object(tc, "AV_PASSWORD", "p-a"), \
+                mock.patch.object(login_guard, "record_video", stalled_record):
+            key_a = login_guard.key_fingerprint("UID-A", "k-a", "p-a")
+            tc._on_first_frame()
+            self.assertTrue(entered.wait(WAIT))
+            tc.UID, tc.AUTHKEY, tc.AV_PASSWORD = "UID-B", "k-b", "p-b"   # refreshed key
+            self.gate.set()
+            self.assertTrue(tc._guard_drain(WAIT))
+        self.assertEqual(seen, [key_a])
 
 
 @unittest.skipUnless(hasattr(signal, "SIGTERM") and os.name == "posix", "POSIX only")
@@ -245,7 +268,11 @@ class ExitWithWedgedStderrTests(unittest.TestCase):
         threading.Thread(target=lambda: print("other module warning", file=sys.stderr),
                          daemon=True).start()
         print("from the main thread", file=sys.stderr)
-        time.sleep(0.5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and tc._log_drain(0.1):
+            pass
+        if tc._log_drain(0.5):
+            os._exit(42)                           # premise failed: stderr is not wedged
     """
 
     def _start(self, body: str) -> subprocess.Popen:
@@ -288,6 +315,9 @@ class ExitWithWedgedStderrTests(unittest.TestCase):
             finally:
                 time.sleep(0.5)                    # "teardown" a second SIGTERM must not cut
         """)
+        import select
+        ready, _, _ = select.select([p.stdout], [], [], 15)
+        self.assertTrue(ready, "the child never became ready")
         self.assertEqual(p.stdout.readline().strip(), b"ready")
         p.send_signal(signal.SIGTERM)
         time.sleep(0.2)

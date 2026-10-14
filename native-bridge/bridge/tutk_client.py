@@ -248,7 +248,9 @@ def _write_cam_sensors_now() -> None:
     with _CAM_SENSORS_LOCK:
         data = json.dumps(_CAM_SENSORS)
     try:
-        tmp = path + ".tmp"
+        # process-unique: a replacement stream process (spare-stream swap) can
+        # run next to the old one for a moment, and both write this sidecar
+        tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
             f.write(data)
         os.replace(tmp, path)
@@ -1183,7 +1185,7 @@ def _log_writer(q: "queue.Queue[str | None]") -> None:
             text = line
             if dropped:
                 text = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} [tutk] [log] {dropped} "
-                        "line(s) dropped while the log was not draining\n") + line
+                        "record(s) dropped while the log was not draining\n") + line
             try:
                 _log_sink(text)
             except Exception:  # noqa: BLE001
@@ -1200,7 +1202,10 @@ def _ensure_log_writer() -> None:
         if _LOG_WRITER[0] is None:
             t = threading.Thread(target=_log_writer, args=(_LOG_Q,), name="log-writer",
                                  daemon=True)
-            t.start()
+            try:
+                t.start()
+            except RuntimeError:      # interpreter shutting down: the line is lost
+                return
             _LOG_WRITER[0] = t
 
 
@@ -1241,35 +1246,23 @@ class _QueuedStderr(io.TextIOBase):
     guard's and config store's warnings, uncaught-exception tracebacks) goes
     through the same non-blocking queue as log(). A plain sys.stderr could
     block its caller on a slow /config, and a writer stuck in it would hold the
-    buffer lock that interpreter shutdown needs for its final flush. Partial
-    writes are joined per thread up to the newline so lines don't interleave."""
+    buffer lock that interpreter shutdown needs for its final flush. Each write
+    is queued as it comes (no buffering, so nothing is left behind for a flush
+    at interpreter shutdown, after the drains have run)."""
 
     encoding = "utf-8"
     errors = "backslashreplace"
-
-    def __init__(self):
-        super().__init__()
-        self._local = threading.local()
 
     def writable(self) -> bool:
         return True
 
     def write(self, text: str) -> int:
-        if not text:
-            return 0
-        buf = getattr(self._local, "buf", "") + text
-        cut = buf.rfind("\n") + 1
-        if cut:
-            _enqueue_log(buf[:cut])
-            buf = buf[cut:]
-        self._local.buf = buf
+        if text:
+            _enqueue_log(text)
         return len(text)
 
     def flush(self) -> None:
-        buf = getattr(self._local, "buf", "")
-        if buf:
-            self._local.buf = ""
-            _enqueue_log(buf + "\n")
+        pass
 
 
 def _install_queued_stderr() -> None:
@@ -1741,7 +1734,8 @@ def _stall_supervisor(av: CDLL, av_idx: int, st: dict, done: threading.Event) ->
     returning from avRecvFrameData2 / the stdout write. When either blocks this
     is the only thing that notices. Ladder:
       1. capture the main thread's wait channel + every thread's Python stack
-         without I/O (the evidence TOT-35 was missing) and queue them for the
+         without touching /config or source files (the evidence TOT-35 was
+         missing) and queue them for the
          log writer, so a slow log sink never delays the recovery;
       2. avClientStop() — unblocks a recv parked in the lib; the frame loop then
          sees an error, hits its own timeout and reconnects CLEANLY (session
@@ -1755,7 +1749,8 @@ def _stall_supervisor(av: CDLL, av_idx: int, st: dict, done: threading.Event) ->
         idle = time.time() - st["video_at"]
         if idle < limit:
             continue
-        # Evidence is captured without I/O and only queued for the log writer,
+        # Evidence is captured without /config or source-file access and only
+        # queued for the log writer,
         # so avClientStop follows at once: the old synchronous log write + stack
         # dump delayed the recovery of the very stall it reported (2026-10-14:
         # 12-22 s on a slow /config).
