@@ -568,12 +568,15 @@ class TutkSidecarWriterTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "cam-x.json")
         for name, val in (("CAM_SENSORS_PATH", self.path), ("SENSORS_ENABLED", True),
-                          ("TEMP_SCALE", 1.0), ("_CAM_SENSORS", {})):
+                          ("TEMP_SCALE", 1.0), ("_CAM_SENSORS", {}),
+                          # write synchronously here; the writer thread has its own tests
+                          ("_ensure_sensor_writer", lambda: None)):
             p = mock.patch.object(tc, name, val)
             p.start()
             self.addCleanup(p.stop)
 
     def read(self):
+        tc._write_cam_sensors_now()
         with open(self.path) as f:
             return json.load(f)
 

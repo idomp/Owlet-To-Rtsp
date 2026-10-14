@@ -29,15 +29,17 @@ in TUTK_LIB_DIR.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
-import faulthandler
 import fcntl
 import json
 import os
+import queue
 import struct
 import sys
 import threading
 import time
+import traceback
 from ctypes import (
     CDLL,
     POINTER,
@@ -200,7 +202,7 @@ def _gate_realtime(temp, humidity):
 
 
 def _publish_cam_sensors(_clear=(), **fields) -> None:
-    """Merge new readings into the sidecar JSON (atomic write).
+    """Merge new readings into the in-memory state and wake the sidecar writer.
 
     Every field carries its own measurement time in "field_ts", so a reader can
     tell a fresh temperature from a humidity value last seen an hour ago (the
@@ -223,13 +225,56 @@ def _publish_cam_sensors(_clear=(), **fields) -> None:
                 _CAM_SENSORS[k] = v
                 fts[k] = now
         _CAM_SENSORS["ts"] = now
+    # The file write happens on the sidecar writer thread, never here: this is
+    # called from the video frame loop, and a slow /config (Unraid's FUSE user
+    # share under mover load, 2026-10-14) stalled video for 30 s at a time.
+    _ensure_sensor_writer()
+    _CAM_SENSORS_DIRTY.set()
+
+
+_CAM_SENSORS_DIRTY = threading.Event()
+_SENSOR_FILE_LOCK = threading.Lock()   # serializes writers on the shared .tmp name
+_SENSOR_WRITER: list = [None]
+_SENSOR_WRITER_START = threading.Lock()
+
+
+def _write_cam_sensors_now() -> None:
+    """Write the latest readings to the sidecar (atomic replace). Holds
+    _CAM_SENSORS_LOCK only for the in-memory snapshot, so a slow disk never
+    blocks a publisher."""
+    path = CAM_SENSORS_PATH
+    if not path:
+        return
+    with _CAM_SENSORS_LOCK:
+        data = json.dumps(_CAM_SENSORS)
+    with _SENSOR_FILE_LOCK:
         try:
-            tmp = CAM_SENSORS_PATH + ".tmp"
+            tmp = path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(_CAM_SENSORS, f)
-            os.replace(tmp, CAM_SENSORS_PATH)
+                f.write(data)
+            os.replace(tmp, path)
         except OSError:
             pass
+
+
+def _sensor_writer(dirty: threading.Event) -> None:
+    """Single writer: wakes on new readings and writes only the latest state,
+    so a stalled disk delays the sidecar instead of queueing writes."""
+    while True:
+        dirty.wait()
+        dirty.clear()
+        _write_cam_sensors_now()
+
+
+def _ensure_sensor_writer() -> None:
+    if _SENSOR_WRITER[0] is not None:
+        return
+    with _SENSOR_WRITER_START:
+        if _SENSOR_WRITER[0] is None:
+            t = threading.Thread(target=_sensor_writer, args=(_CAM_SENSORS_DIRTY,),
+                                 name="sensor-writer", daemon=True)
+            t.start()
+            _SENSOR_WRITER[0] = t
 
 
 def _parse_frame_sensors(info: bytes, n: int) -> None:
@@ -1101,9 +1146,68 @@ class St_AVClientStartOutConfig(Structure):
     ]
 
 
+# Logging never blocks the caller. stderr is the /config/tutk-<cam>.log file
+# (the exec appends to it), and a slow /config used to freeze the video loop and
+# the stall supervisor in their own log writes. Lines go through a bounded queue
+# to one writer thread; when the queue is full, lines are dropped and counted.
+LOG_QUEUE_MAX = 2000
+_LOG_Q: "queue.Queue[str]" = queue.Queue(maxsize=LOG_QUEUE_MAX)
+_LOG_DROPPED = [0]
+_LOG_STATE_LOCK = threading.Lock()
+_LOG_WRITER: list = [None]
+
+
+def _log_writer(q: "queue.Queue[str]") -> None:
+    while True:
+        line = q.get()
+        try:
+            with _LOG_STATE_LOCK:
+                dropped, _LOG_DROPPED[0] = _LOG_DROPPED[0], 0
+            err = sys.stderr
+            if dropped:
+                err.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [tutk] [log] "
+                          f"{dropped} line(s) dropped while the log was not draining\n")
+            err.write(line)
+            err.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            q.task_done()
+
+
+def _ensure_log_writer() -> None:
+    if _LOG_WRITER[0] is not None:
+        return
+    with _LOG_STATE_LOCK:
+        if _LOG_WRITER[0] is None:
+            t = threading.Thread(target=_log_writer, args=(_LOG_Q,), name="log-writer",
+                                 daemon=True)
+            t.start()
+            _LOG_WRITER[0] = t
+
+
 def log(*a):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(ts, "[tutk]", *a, file=sys.stderr, flush=True)
+    line = " ".join([ts, "[tutk]", *map(str, a)]) + "\n"
+    _ensure_log_writer()
+    try:
+        _LOG_Q.put_nowait(line)
+    except queue.Full:
+        with _LOG_STATE_LOCK:
+            _LOG_DROPPED[0] += 1
+
+
+def _log_drain(timeout: float = 2.0) -> bool:
+    """Wait (bounded) for queued lines to be written. True if the queue emptied."""
+    end = time.monotonic() + timeout
+    while _LOG_Q.unfinished_tasks:
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+atexit.register(_log_drain, 2.0)
 
 
 def _set_sig(lib, name, restype, argtypes):
@@ -1474,6 +1578,20 @@ def _main_wchan() -> str:
         return "?"
 
 
+def _thread_stacks() -> str:
+    """Every thread's Python stack as text, built in memory (faulthandler would
+    write straight to the possibly stalled log file)."""
+    try:
+        names = {t.ident: t.name for t in threading.enumerate()}
+        parts = []
+        for ident, frame in sys._current_frames().items():
+            parts.append(f"Thread {names.get(ident, '?')} ({ident}), most recent call last:\n"
+                         + "".join(traceback.format_stack(frame)))
+        return "\n".join(parts)
+    except Exception as e:  # noqa: BLE001
+        return f"(stack capture failed: {e})"
+
+
 def _cam_name() -> str:
     """This stream's camera name, recovered from the talk FIFO path the exec sets
     (${TMPDIR}/owlet-talk-<name>)."""
@@ -1550,8 +1668,9 @@ def _stall_supervisor(av: CDLL, av_idx: int, st: dict, done: threading.Event) ->
     stream_once()'s own NO_VIDEO_TIMEOUT only works while the main thread keeps
     returning from avRecvFrameData2 / the stdout write. When either blocks this
     is the only thing that notices. Ladder:
-      1. log it, with the main thread's wait channel + every thread's Python
-         stack (the evidence TOT-35 was missing);
+      1. capture the main thread's wait channel + every thread's Python stack
+         in memory (the evidence TOT-35 was missing) and log them right after
+         step 2, so a slow log sink never delays the recovery;
       2. avClientStop() — unblocks a recv parked in the lib; the frame loop then
          sees an error, hits its own timeout and reconnects CLEANLY (session
          released, fresh KMS key, normal RECONNECT_WAIT);
@@ -1564,20 +1683,21 @@ def _stall_supervisor(av: CDLL, av_idx: int, st: dict, done: threading.Event) ->
         idle = time.time() - st["video_at"]
         if idle < limit:
             continue
-        log(f"[stall] no video forwarded for {int(idle)}s (frames={st['frames']}) and "
-            f"the frame loop never hit its own {NO_VIDEO_TIMEOUT}s timeout — main "
-            f"thread is blocked (wchan={_main_wchan()}); dumping thread stacks")
-        try:
-            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-            sys.stderr.flush()
-        except Exception:  # noqa: BLE001
-            pass
-        log("[stall] avClientStop() to break the blocked receive …")
+        # Evidence first, in memory only (no I/O), then act at once: logging used
+        # to go out before avClientStop, so a slow log sink delayed the recovery
+        # of the very stall it was reporting (2026-10-14: 12-22 s).
+        wchan = _main_wchan()
+        stacks = _thread_stacks()
         try:
             rc = av.avClientStop(av_idx)
-            log(f"[stall] avClientStop -> {rc}")
+            stop_msg = f"[stall] avClientStop -> {rc}"
         except Exception as e:  # noqa: BLE001
-            log(f"[stall] avClientStop raised: {e}")
+            stop_msg = f"[stall] avClientStop raised: {e}"
+        log(f"[stall] no video forwarded for {int(idle)}s (frames={st['frames']}) and "
+            f"the frame loop never hit its own {NO_VIDEO_TIMEOUT}s timeout — main "
+            f"thread was blocked (wchan={wchan}); called avClientStop() to break it")
+        log("[stall] thread stacks at detection:\n" + stacks)
+        log(stop_msg)
         if done.wait(STALL_UNBLOCK_WAIT):
             log("[stall] frame loop is back — reconnecting normally")
             return
@@ -1594,10 +1714,7 @@ def _stall_supervisor(av: CDLL, av_idx: int, st: dict, done: threading.Event) ->
             _kill_downstream(readers)
         else:
             log("[stall] no downstream ffmpeg found on our stdout pipe")
-        try:
-            sys.stderr.flush()
-        except Exception:  # noqa: BLE001
-            pass
+        _log_drain(2.0)   # bounded: a wedged log sink must not block the exit
         os._exit(6)
 
 
