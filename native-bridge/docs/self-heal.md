@@ -107,9 +107,14 @@ KMS fetch, then the new key is saved) happens only when all of these hold:
   stderr (`[tutk]` lines, other modules' warnings, tracebacks) goes through one
   non-blocking queue (lines are dropped and counted if the log cannot drain),
   and the sensor sidecar and the first-frame login-guard report are written by
-  their own threads, so a slow `/config` cannot stall video or delay recovery.
-  Native TUTK code still inherits fd 2 directly; it has not been seen writing
-  to it. On Unraid, map `/config` and `/app/libs` to the pool path
+  their own threads, so the bridge's own Python code no longer waits on a slow
+  `/config` in the frame loop or before `avClientStop()`. Limits: native TUTK
+  code still inherits fd 2 directly (not seen writing to it); `avClientStop()`
+  itself has no timeout; a replacement process still reads its config and opens
+  the log at start; credential refresh between sessions still touches
+  `/config`. Under a full queue or at exit, log records (including a stall's
+  stack dump) can be dropped, and a `print()` from another module can arrive
+  split around another thread's line. On Unraid, map `/config` and `/app/libs` to the pool path
   (`/mnt/cache/appdata/...`) rather than `/mnt/user/...`: the user-share FUSE
   layer stalled for tens of seconds under mover load (2026-10-14).
 * Container log (`docker logs owlet-bridge-native`) — `[watchdog] …` lines:

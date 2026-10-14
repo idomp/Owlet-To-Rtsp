@@ -243,12 +243,13 @@ class FirstFrameGuardReportTests(unittest.TestCase):
                 mock.patch.object(tc, "AV_PASSWORD", "p-a"), \
                 mock.patch.object(login_guard, "record_video", stalled_record):
             key_a = login_guard.key_fingerprint("UID-A", "k-a", "p-a")
-            tc._on_first_frame()
+            tc._dispatch_guard_report("earlier")    # occupies the worker
             self.assertTrue(entered.wait(WAIT))
+            tc._on_first_frame()                    # queued behind it, on key A
             tc.UID, tc.AUTHKEY, tc.AV_PASSWORD = "UID-B", "k-b", "p-b"   # refreshed key
             self.gate.set()
             self.assertTrue(tc._guard_drain(WAIT))
-        self.assertEqual(seen, [key_a])
+        self.assertEqual(seen, ["earlier", key_a])
 
 
 @unittest.skipUnless(hasattr(signal, "SIGTERM") and os.name == "posix", "POSIX only")
@@ -313,15 +314,23 @@ class ExitWithWedgedStderrTests(unittest.TestCase):
                 while True:
                     time.sleep(0.1)
             finally:
-                time.sleep(0.5)                    # "teardown" a second SIGTERM must not cut
+                # "teardown" that the second SIGTERM must not cut short
+                sys.stdout.write("teardown-start\\n"); sys.stdout.flush()
+                time.sleep(1.0)
+                sys.stdout.write("teardown-done\\n"); sys.stdout.flush()
         """)
         import select
-        ready, _, _ = select.select([p.stdout], [], [], 15)
-        self.assertTrue(ready, "the child never became ready")
-        self.assertEqual(p.stdout.readline().strip(), b"ready")
+
+        def line():
+            ready, _, _ = select.select([p.stdout], [], [], 15)
+            self.assertTrue(ready, "the child stopped talking")
+            return p.stdout.readline().strip()
+
+        self.assertEqual(line(), b"ready")
         p.send_signal(signal.SIGTERM)
-        time.sleep(0.2)
-        p.send_signal(signal.SIGTERM)
+        self.assertEqual(line(), b"teardown-start")
+        p.send_signal(signal.SIGTERM)              # lands inside the teardown
+        self.assertEqual(line(), b"teardown-done")
         self.assertEqual(self._wait(p), 0)
 
     def test_stall_escalation_hard_exit(self):
