@@ -233,7 +233,7 @@ def _publish_cam_sensors(_clear=(), **fields) -> None:
 
 
 _CAM_SENSORS_DIRTY = threading.Event()
-_SENSOR_FILE_LOCK = threading.Lock()   # serializes writers on the shared .tmp name
+_SENSOR_WRITER_STOP = threading.Event()   # tests only; production never stops it
 _SENSOR_WRITER: list = [None]
 _SENSOR_WRITER_START = threading.Lock()
 
@@ -247,21 +247,23 @@ def _write_cam_sensors_now() -> None:
         return
     with _CAM_SENSORS_LOCK:
         data = json.dumps(_CAM_SENSORS)
-    with _SENSOR_FILE_LOCK:
-        try:
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                f.write(data)
-            os.replace(tmp, path)
-        except OSError:
-            pass
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
-def _sensor_writer(dirty: threading.Event) -> None:
-    """Single writer: wakes on new readings and writes only the latest state,
-    so a stalled disk delays the sidecar instead of queueing writes."""
+def _sensor_writer(dirty: threading.Event, stop: threading.Event) -> None:
+    """The only writer of the sidecar: wakes on new readings and writes only
+    the latest state, so a stalled disk delays the sidecar instead of queueing
+    writes."""
     while True:
         dirty.wait()
+        if stop.is_set():
+            return
         dirty.clear()
         _write_cam_sensors_now()
 
@@ -271,7 +273,8 @@ def _ensure_sensor_writer() -> None:
         return
     with _SENSOR_WRITER_START:
         if _SENSOR_WRITER[0] is None:
-            t = threading.Thread(target=_sensor_writer, args=(_CAM_SENSORS_DIRTY,),
+            t = threading.Thread(target=_sensor_writer,
+                                 args=(_CAM_SENSORS_DIRTY, _SENSOR_WRITER_STOP),
                                  name="sensor-writer", daemon=True)
             t.start()
             _SENSOR_WRITER[0] = t
@@ -1149,28 +1152,43 @@ class St_AVClientStartOutConfig(Structure):
 # Logging never blocks the caller. stderr is the /config/tutk-<cam>.log file
 # (the exec appends to it), and a slow /config used to freeze the video loop and
 # the stall supervisor in their own log writes. Lines go through a bounded queue
-# to one writer thread; when the queue is full, lines are dropped and counted.
+# to one writer thread; lines that cannot be queued or written are counted and
+# reported as dropped. The writer uses os.write on fd 2, not sys.stderr, so a
+# write blocked in the kernel holds no lock that interpreter shutdown needs
+# (its final flush of sys.stderr would otherwise wait on it).
+# Scope: this covers everything the bridge logs. Native TUTK code inherits fd 2
+# too, but the SDK has not been seen writing to it (no such line in two days of
+# production logs, 2026-10-14).
 LOG_QUEUE_MAX = 2000
-_LOG_Q: "queue.Queue[str]" = queue.Queue(maxsize=LOG_QUEUE_MAX)
+_LOG_Q: "queue.Queue[str | None]" = queue.Queue(maxsize=LOG_QUEUE_MAX)
 _LOG_DROPPED = [0]
 _LOG_STATE_LOCK = threading.Lock()
 _LOG_WRITER: list = [None]
 
 
-def _log_writer(q: "queue.Queue[str]") -> None:
+def _log_sink(text: str) -> None:
+    data = text.encode("utf-8", "backslashreplace")
+    while data:
+        data = data[os.write(2, data):]
+
+
+def _log_writer(q: "queue.Queue[str | None]") -> None:
     while True:
         line = q.get()
         try:
+            if line is None:          # stop sentinel (tests)
+                return
             with _LOG_STATE_LOCK:
                 dropped, _LOG_DROPPED[0] = _LOG_DROPPED[0], 0
-            err = sys.stderr
+            text = line
             if dropped:
-                err.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [tutk] [log] "
-                          f"{dropped} line(s) dropped while the log was not draining\n")
-            err.write(line)
-            err.flush()
-        except Exception:  # noqa: BLE001
-            pass
+                text = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} [tutk] [log] {dropped} "
+                        "line(s) dropped while the log was not draining\n") + line
+            try:
+                _log_sink(text)
+            except Exception:  # noqa: BLE001
+                with _LOG_STATE_LOCK:
+                    _LOG_DROPPED[0] += dropped + 1
         finally:
             q.task_done()
 
@@ -1197,17 +1215,42 @@ def log(*a):
             _LOG_DROPPED[0] += 1
 
 
-def _log_drain(timeout: float = 2.0) -> bool:
-    """Wait (bounded) for queued lines to be written. True if the queue emptied."""
+def _drain(q: queue.Queue, timeout: float) -> bool:
+    """Wait (bounded) until every item put on `q` was processed."""
     end = time.monotonic() + timeout
-    while _LOG_Q.unfinished_tasks:
+    while q.unfinished_tasks:
         if time.monotonic() >= end:
             return False
         time.sleep(0.02)
     return True
 
 
+def _log_drain(timeout: float = 2.0) -> bool:
+    """Wait (bounded) for queued lines to be written. True if the queue emptied."""
+    return _drain(_LOG_Q, timeout)
+
+
 atexit.register(_log_drain, 2.0)
+
+
+def _excepthook(exc_type, exc, tb) -> None:
+    """Uncaught exceptions go through the queued log too, so printing a traceback
+    cannot block process exit on a stalled log file."""
+    log("uncaught exception:\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
+
+
+def _thread_excepthook(args) -> None:
+    if args.exc_type is SystemExit:
+        return
+    name = args.thread.name if args.thread is not None else "?"
+    log(f"uncaught exception in thread {name!r}:\n"
+        + "".join(traceback.format_exception(args.exc_type, args.exc_value,
+                                             args.exc_traceback)))
+
+
+def _install_excepthooks() -> None:
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
 
 
 def _set_sig(lib, name, restype, argtypes):
@@ -1579,14 +1622,20 @@ def _main_wchan() -> str:
 
 
 def _thread_stacks() -> str:
-    """Every thread's Python stack as text, built in memory (faulthandler would
-    write straight to the possibly stalled log file)."""
+    """Every thread's Python stack as text, faulthandler-style (most recent call
+    first), from frame metadata only: no source lookup, no file I/O
+    (faulthandler would write straight to the possibly stalled log file)."""
     try:
         names = {t.ident: t.name for t in threading.enumerate()}
         parts = []
         for ident, frame in sys._current_frames().items():
-            parts.append(f"Thread {names.get(ident, '?')} ({ident}), most recent call last:\n"
-                         + "".join(traceback.format_stack(frame)))
+            lines = [f"Thread {names.get(ident, '?')} ({ident}), most recent call first:"]
+            f = frame
+            while f is not None:
+                co = f.f_code
+                lines.append(f'  File "{co.co_filename}", line {f.f_lineno} in {co.co_name}')
+                f = f.f_back
+            parts.append("\n".join(lines))
         return "\n".join(parts)
     except Exception as e:  # noqa: BLE001
         return f"(stack capture failed: {e})"
@@ -1669,8 +1718,8 @@ def _stall_supervisor(av: CDLL, av_idx: int, st: dict, done: threading.Event) ->
     returning from avRecvFrameData2 / the stdout write. When either blocks this
     is the only thing that notices. Ladder:
       1. capture the main thread's wait channel + every thread's Python stack
-         in memory (the evidence TOT-35 was missing) and log them right after
-         step 2, so a slow log sink never delays the recovery;
+         without I/O (the evidence TOT-35 was missing) and queue them for the
+         log writer, so a slow log sink never delays the recovery;
       2. avClientStop() — unblocks a recv parked in the lib; the frame loop then
          sees an error, hits its own timeout and reconnects CLEANLY (session
          released, fresh KMS key, normal RECONNECT_WAIT);
@@ -1683,21 +1732,21 @@ def _stall_supervisor(av: CDLL, av_idx: int, st: dict, done: threading.Event) ->
         idle = time.time() - st["video_at"]
         if idle < limit:
             continue
-        # Evidence first, in memory only (no I/O), then act at once: logging used
-        # to go out before avClientStop, so a slow log sink delayed the recovery
-        # of the very stall it was reporting (2026-10-14: 12-22 s).
+        # Evidence is captured without I/O and only queued for the log writer,
+        # so avClientStop follows at once: the old synchronous log write + stack
+        # dump delayed the recovery of the very stall it reported (2026-10-14:
+        # 12-22 s on a slow /config).
         wchan = _main_wchan()
         stacks = _thread_stacks()
-        try:
-            rc = av.avClientStop(av_idx)
-            stop_msg = f"[stall] avClientStop -> {rc}"
-        except Exception as e:  # noqa: BLE001
-            stop_msg = f"[stall] avClientStop raised: {e}"
         log(f"[stall] no video forwarded for {int(idle)}s (frames={st['frames']}) and "
             f"the frame loop never hit its own {NO_VIDEO_TIMEOUT}s timeout — main "
-            f"thread was blocked (wchan={wchan}); called avClientStop() to break it")
+            f"thread is blocked (wchan={wchan}); calling avClientStop() to break it")
         log("[stall] thread stacks at detection:\n" + stacks)
-        log(stop_msg)
+        try:
+            rc = av.avClientStop(av_idx)
+            log(f"[stall] avClientStop -> {rc}")
+        except Exception as e:  # noqa: BLE001
+            log(f"[stall] avClientStop raised: {e}")
         if done.wait(STALL_UNBLOCK_WAIT):
             log("[stall] frame loop is back — reconnecting normally")
             return
@@ -1714,7 +1763,8 @@ def _stall_supervisor(av: CDLL, av_idx: int, st: dict, done: threading.Event) ->
             _kill_downstream(readers)
         else:
             log("[stall] no downstream ffmpeg found on our stdout pipe")
-        _log_drain(2.0)   # bounded: a wedged log sink must not block the exit
+        _guard_drain(1.0)  # bounded: a wedged /config must not block the exit
+        _log_drain(2.0)
         os._exit(6)
 
 
@@ -1791,11 +1841,69 @@ def _on_first_frame() -> None:
     _SUCCESS_RECORDED[0] = True
     try:
         import login_guard
-        login_guard.record_video(login_guard.key_fingerprint(UID, AUTHKEY, AV_PASSWORD))
+        # fingerprint now: a later reconnect may change the key globals
+        fp = login_guard.key_fingerprint(UID, AUTHKEY, AV_PASSWORD)
     except Exception as e:  # noqa: BLE001
-        if not _GUARD_ERR_LOGGED[0]:
-            _GUARD_ERR_LOGGED[0] = True
-            log(f"could not reset the login guard after video ({e}); continuing")
+        _guard_error(e)
+        return
+    _dispatch_guard_report(fp)
+
+
+def _guard_error(e: Exception) -> None:
+    if not _GUARD_ERR_LOGGED[0]:
+        _GUARD_ERR_LOGGED[0] = True
+        log(f"could not reset the login guard after video ({e}); continuing")
+
+
+def _record_video_now(fp: str) -> None:
+    """Report video on key `fp` to the account-wide guard (locks and may write
+    its state file in /config). Never raises."""
+    try:
+        import login_guard
+        login_guard.record_video(fp)
+    except Exception as e:  # noqa: BLE001
+        _guard_error(e)
+
+
+# The guard report locks and may rewrite a file in /config, so it runs on its
+# own worker instead of the frame loop (a slow /config would freeze video right
+# after the first frame). Exits drain it with a bound, so a SIGTERM or broken
+# pipe shortly after video still records the report.
+_GUARD_Q: "queue.Queue[str | None]" = queue.Queue(maxsize=16)
+_GUARD_WORKER: list = [None]
+_GUARD_WORKER_START = threading.Lock()
+
+
+def _guard_worker(q: "queue.Queue[str | None]") -> None:
+    while True:
+        fp = q.get()
+        try:
+            if fp is None:            # stop sentinel (tests)
+                return
+            _record_video_now(fp)
+        finally:
+            q.task_done()
+
+
+def _dispatch_guard_report(fp: str) -> None:
+    if _GUARD_WORKER[0] is None:
+        with _GUARD_WORKER_START:
+            if _GUARD_WORKER[0] is None:
+                t = threading.Thread(target=_guard_worker, args=(_GUARD_Q,),
+                                     name="guard-report", daemon=True)
+                t.start()
+                _GUARD_WORKER[0] = t
+    try:
+        _GUARD_Q.put_nowait(fp)
+    except queue.Full:
+        log("[guard] report queue full (state file not draining); report dropped")
+
+
+def _guard_drain(timeout: float = 1.0) -> bool:
+    return _drain(_GUARD_Q, timeout)
+
+
+atexit.register(_guard_drain, 1.0)   # atexit is LIFO: runs before the log drain
 
 
 def _refresh_allowed() -> bool:
@@ -1929,6 +2037,7 @@ def main() -> None:
     # cam holds the single P2P slot and the next connect is refused.
     import signal
     signal.signal(signal.SIGTERM, _on_sigterm)
+    _install_excepthooks()
     # Saved key first; log in at start only if there is no saved UID at all.
     uid = resolve_creds(refresh=not UID)
     last_kms = time.monotonic()

@@ -21,6 +21,19 @@ import config_store as cs  # noqa: E402
 import login_guard as lg  # noqa: E402
 import tutk_client as tc  # noqa: E402
 
+# Production reports first-frame video to the guard on a worker thread
+# (test_hot_path_io covers that); these tests check the guard logic itself,
+# so they report synchronously.
+_SYNC_REPORT = mock.patch.object(tc, "_dispatch_guard_report", tc._record_video_now)
+
+
+def setUpModule():
+    _SYNC_REPORT.start()
+
+
+def tearDownModule():
+    _SYNC_REPORT.stop()
+
 
 class TmpConfig(unittest.TestCase):
     def setUp(self):
