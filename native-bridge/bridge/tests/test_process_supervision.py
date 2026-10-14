@@ -275,7 +275,9 @@ class TutkSigtermHandlerTests(unittest.TestCase):
                 exits += 1
         self.assertEqual(exits, 1, "exactly one SystemExit, later SIGTERMs ignored")
         self.assertTrue(self.tc._SHUTTING_DOWN["flag"])
-        self.assertEqual(len(self.logs), 1, "the ignored repeat is logged once")
+        self.assertEqual(self.logs, [], "nothing is logged inside the signal handler")
+        self.tc._note_repeated_sigterm()           # the atexit note
+        self.assertEqual(len(self.logs), 1, "the ignored repeat is logged once, at exit")
 
     def test_main_installs_the_idempotent_handler(self):
         installed = {}

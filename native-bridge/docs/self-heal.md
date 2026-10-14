@@ -102,10 +102,14 @@ KMS fetch, then the new key is saved) happens only when all of these hold:
   blocked inside the TUTK lib; `request_wait_answer` = a FUSE filesystem wait)
   and a Python stack dump of every thread. This is the diagnostic that was
   missing; a few of these will settle *where* the wedge is. The supervisor
-  captures both in memory and calls `avClientStop()` before writing them, and
-  all `[tutk]` logging goes through a non-blocking queue (lines are dropped and
-  counted if the log cannot drain), so a slow `/config` cannot stall video or
-  delay recovery. On Unraid, map `/config` and `/app/libs` to the pool path
+  captures both without I/O, queues them, and calls `avClientStop()` without
+  waiting for them to be written. Everything the stream process writes to
+  stderr (`[tutk]` lines, other modules' warnings, tracebacks) goes through one
+  non-blocking queue (lines are dropped and counted if the log cannot drain),
+  and the sensor sidecar and the first-frame login-guard report are written by
+  their own threads, so a slow `/config` cannot stall video or delay recovery.
+  Native TUTK code still inherits fd 2 directly; it has not been seen writing
+  to it. On Unraid, map `/config` and `/app/libs` to the pool path
   (`/mnt/cache/appdata/...`) rather than `/mnt/user/...`: the user-share FUSE
   layer stalled for tens of seconds under mover load (2026-10-14).
 * Container log (`docker logs owlet-bridge-native`) — `[watchdog] …` lines:

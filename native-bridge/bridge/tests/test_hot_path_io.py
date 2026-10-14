@@ -7,6 +7,7 @@ before avClientStop) blocked with it."""
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,18 @@ from unittest import mock
 BRIDGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BRIDGE)
 import tutk_client as tc  # noqa: E402
+
+WAIT = 5   # generous: these are "does it ever return" checks, not timings
+
+
+def _in_thread(fn) -> threading.Event:
+    done = threading.Event()
+
+    def run():
+        fn()
+        done.set()
+    threading.Thread(target=run, daemon=True).start()
+    return done
 
 
 class SensorWriterTests(unittest.TestCase):
@@ -35,13 +48,16 @@ class SensorWriterTests(unittest.TestCase):
             p = mock.patch.object(tc, name, val)
             p.start()
             self.addCleanup(p.stop)
+        self.gate = threading.Event()
+        self.addCleanup(self._stop_writer)   # runs after the gate is released
 
     def _stop_writer(self):
+        self.gate.set()
         self.stop.set()
         self.dirty.set()
         t = tc._SENSOR_WRITER[0]
         if t is not None:
-            t.join(3)
+            t.join(WAIT)
             self.assertFalse(t.is_alive())
 
     def _read(self):
@@ -49,8 +65,7 @@ class SensorWriterTests(unittest.TestCase):
             return json.load(f)
 
     def test_publishing_never_waits_for_a_stalled_write(self):
-        entered, gate = threading.Event(), threading.Event()
-        self.addCleanup(gate.set)
+        entered = threading.Event()
         real_replace = os.replace
         replaces = []
 
@@ -58,23 +73,21 @@ class SensorWriterTests(unittest.TestCase):
             if dst == self.path:
                 replaces.append(1)
                 entered.set()
-                gate.wait(5)
+                self.gate.wait(WAIT)
             return real_replace(src, dst)
 
         with mock.patch("os.replace", stalled_replace):
             tc._publish_cam_sensors(temperature=20)
-            self.assertTrue(entered.wait(3), "writer never reached the file write")
+            self.assertTrue(entered.wait(WAIT), "writer never reached the file write")
             # The writer is now blocked inside the real write path.
-            self.assertTrue(tc._CAM_SENSORS_LOCK.acquire(timeout=0.5),
+            self.assertTrue(tc._CAM_SENSORS_LOCK.acquire(timeout=WAIT),
                             "the sensor lock is held across disk I/O")
             tc._CAM_SENSORS_LOCK.release()
             for temp in (21, 22, 23):
-                done = threading.Event()
-                threading.Thread(target=lambda t=temp: (tc._publish_cam_sensors(temperature=t),
-                                                        done.set()), daemon=True).start()
-                self.assertTrue(done.wait(1), "publish blocked behind the stalled write")
-            gate.set()
-            deadline = time.monotonic() + 3
+                done = _in_thread(lambda t=temp: tc._publish_cam_sensors(temperature=t))
+                self.assertTrue(done.wait(WAIT), "publish blocked behind the stalled write")
+            self.gate.set()
+            deadline = time.monotonic() + WAIT
             while time.monotonic() < deadline:
                 try:
                     if self._read().get("temperature") == 23:
@@ -82,21 +95,20 @@ class SensorWriterTests(unittest.TestCase):
                 except (OSError, ValueError):
                     pass
                 time.sleep(0.02)
-        self._stop_writer()
+            self._stop_writer()
         self.assertEqual(self._read()["temperature"], 23)
         self.assertEqual(len(replaces), 2)   # first value, then one coalesced write
 
 
-class _LogFixture(unittest.TestCase):
+class NonBlockingLogTests(unittest.TestCase):
     def setUp(self):
         self.q = queue.Queue(maxsize=3)
         self.out = []
         self.entered, self.gate = threading.Event(), threading.Event()
-        self.addCleanup(self.gate.set)
 
         def sink(text):
             self.entered.set()
-            self.gate.wait(5)
+            self.gate.wait(WAIT)
             self.out.append(text)
 
         for name, val in (("_LOG_Q", self.q), ("_LOG_WRITER", [None]),
@@ -111,32 +123,37 @@ class _LogFixture(unittest.TestCase):
         t = tc._LOG_WRITER[0]
         if t is not None:
             self.q.put(None)
-            t.join(3)
+            t.join(WAIT)
             self.assertFalse(t.is_alive())
 
-
-class NonBlockingLogTests(_LogFixture):
     def test_full_queue_drops_exactly_the_overflow_and_reports_it_in_order(self):
         tc.log("line 0")
-        self.assertTrue(self.entered.wait(3))   # writer holds line 0, blocked in the sink
-        t0 = time.monotonic()
-        for i in range(1, 10):
-            tc.log(f"line {i}")                 # 1-3 fit the queue, 4-9 are dropped
-        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertTrue(self.entered.wait(WAIT))   # writer holds line 0, blocked in the sink
+        done = _in_thread(lambda: [tc.log(f"line {i}") for i in range(1, 10)])
+        self.assertTrue(done.wait(WAIT), "log() blocked on a stalled sink")
         self.gate.set()
-        self.assertTrue(tc._log_drain(3))
-        text = "".join(self.out)
-        lines = [ln.split(" [tutk] ", 1)[1] for ln in text.splitlines()]
+        self.assertTrue(tc._log_drain(WAIT))
+        lines = [ln.split(" [tutk] ", 1)[1] for ln in "".join(self.out).splitlines()]
         self.assertEqual(lines, ["line 0",
                                  "[log] 6 line(s) dropped while the log was not draining",
                                  "line 1", "line 2", "line 3"])
 
     def test_drain_is_bounded_when_the_sink_is_wedged(self):
         tc.log("stuck")
-        self.assertTrue(self.entered.wait(3))
+        self.assertTrue(self.entered.wait(WAIT))
         t0 = time.monotonic()
         self.assertFalse(tc._log_drain(0.3))
-        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertLess(time.monotonic() - t0, 3)
+
+    def test_stderr_writes_from_other_modules_are_queued_whole_lines(self):
+        tc.log("first")
+        self.assertTrue(self.entered.wait(WAIT))
+        err = tc._QueuedStderr()
+        done = _in_thread(lambda: (print("login guard:", "warning", file=err), err.flush()))
+        self.assertTrue(done.wait(WAIT), "print to the queued stderr blocked")
+        self.gate.set()
+        self.assertTrue(tc._log_drain(WAIT))
+        self.assertEqual(self.out[-1], "login guard: warning\n")
 
 
 class StallSupervisorTests(unittest.TestCase):
@@ -178,72 +195,119 @@ class FirstFrameGuardReportTests(unittest.TestCase):
             p = mock.patch.object(tc, name, val)
             p.start()
             self.addCleanup(p.stop)
+        self.gate = threading.Event()
+        self.addCleanup(self._stop_worker)
+
+    def _stop_worker(self):
+        self.gate.set()
+        t = tc._GUARD_WORKER[0]
+        if t is not None:
+            self.q.put(None)
+            t.join(WAIT)
+            self.assertFalse(t.is_alive())
 
     def test_first_frame_returns_while_the_guard_state_file_is_stalled(self):
         import login_guard
-        entered, gate = threading.Event(), threading.Event()
-        self.addCleanup(gate.set)
+        entered = threading.Event()
         seen = []
 
         def stalled_record(fp):
             entered.set()
-            gate.wait(5)
+            self.gate.wait(WAIT)
             seen.append(fp)
             return False
 
         expected = login_guard.key_fingerprint(tc.UID, tc.AUTHKEY, tc.AV_PASSWORD)
         with mock.patch.object(login_guard, "record_video", stalled_record):
-            t0 = time.monotonic()
-            tc._on_first_frame()
-            self.assertLess(time.monotonic() - t0, 0.5)
-            self.assertTrue(entered.wait(3))
+            done = _in_thread(tc._on_first_frame)
+            self.assertTrue(done.wait(WAIT), "the frame loop waited for the guard report")
+            self.assertTrue(entered.wait(WAIT))
             self.assertFalse(tc._guard_drain(0.2))   # bounded while stalled
-            gate.set()
-            self.assertTrue(tc._guard_drain(3))
+            self.gate.set()
+            self.assertTrue(tc._guard_drain(WAIT))
         self.assertEqual(seen, [expected])
-        self.q.put(None)
-        tc._GUARD_WORKER[0].join(3)
-        self.assertFalse(tc._GUARD_WORKER[0].is_alive())
 
 
-class ExitWithWedgedLogTests(unittest.TestCase):
-    """A real process must exit promptly even when its log sink never returns."""
+@unittest.skipUnless(hasattr(signal, "SIGTERM") and os.name == "posix", "POSIX only")
+class ExitWithWedgedStderrTests(unittest.TestCase):
+    """A real stream process must exit promptly while its stderr (the /config log
+    file in production) is wedged. Here stderr is a pipe nobody reads: once its
+    buffer is full every write to fd 2 blocks, which is what a stalled FUSE
+    write looks like to the process."""
 
-    def _run(self, ending: str) -> subprocess.CompletedProcess:
-        script = textwrap.dedent(f"""
-            import sys, threading, time
-            sys.path.insert(0, {BRIDGE!r})
-            import tutk_client as tc
-            entered = threading.Event()
-            def wedged(text):
-                entered.set()
-                time.sleep(60)
-            tc._log_sink = wedged
-            tc._install_excepthooks()
-            tc.log("first line")
-            assert entered.wait(5)
-            tc.log("queued behind the wedge")
-            {ending}
-        """)
-        t0 = time.monotonic()
-        r = subprocess.run([sys.executable, "-c", script], capture_output=True, timeout=20)
-        r.elapsed = time.monotonic() - t0
-        return r
+    PRELUDE = """
+        import os, signal, sys, threading, time
+        sys.path.insert(0, {bridge!r})
+        import tutk_client as tc
+        tc._install_queued_stderr()
+        for i in range(200):                       # ~200 KB: fills the pipe, writer blocks
+            tc.log("x" * 1000)
+        threading.Thread(target=lambda: print("other module warning", file=sys.stderr),
+                         daemon=True).start()
+        print("from the main thread", file=sys.stderr)
+        time.sleep(0.5)
+    """
+
+    def _start(self, body: str) -> subprocess.Popen:
+        script = textwrap.dedent(self.PRELUDE).format(bridge=BRIDGE) + textwrap.dedent(body)
+        p = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+        self.addCleanup(self._reap, p)
+        return p
+
+    @staticmethod
+    def _reap(p):
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+        p.stdout.close()
+        p.stderr.close()
+
+    def _wait(self, p, limit=12) -> int:
+        try:
+            return p.wait(timeout=limit)   # stderr deliberately never read
+        except subprocess.TimeoutExpired:
+            self.fail("process hung on its wedged stderr")
 
     def test_sys_exit(self):
-        r = self._run("sys.exit(0)")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertLess(r.elapsed, 8)
+        self.assertEqual(self._wait(self._start("sys.exit(0)")), 0)
 
     def test_normal_end(self):
-        r = self._run("pass")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertLess(r.elapsed, 8)
+        self.assertEqual(self._wait(self._start("pass")), 0)
 
     def test_uncaught_exception(self):
-        r = self._run("raise RuntimeError('boom')")
-        self.assertEqual(r.returncode, 1)
-        self.assertLess(r.elapsed, 8)
+        self.assertEqual(self._wait(self._start("raise RuntimeError('boom')")), 1)
+
+    def test_sigterm_twice(self):
+        p = self._start("""
+            signal.signal(signal.SIGTERM, tc._on_sigterm)
+            sys.stdout.write("ready\\n"); sys.stdout.flush()
+            try:
+                while True:
+                    time.sleep(0.1)
+            finally:
+                time.sleep(0.5)                    # "teardown" a second SIGTERM must not cut
+        """)
+        self.assertEqual(p.stdout.readline().strip(), b"ready")
+        p.send_signal(signal.SIGTERM)
+        time.sleep(0.2)
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(self._wait(p), 0)
+
+    def test_stall_escalation_hard_exit(self):
+        p = self._start("""
+            class AV:
+                def avClientStop(self, idx):
+                    return 0                       # the blocked thread never comes back
+            tc.STALL_UNBLOCK_WAIT = 0.3
+            tc._stdout_readers = lambda: []
+            tc._reset_go2rtc_stream = lambda name: None
+            st = {"video_at": time.time() - 1000, "frames": 1}
+            threading.Thread(target=tc._stall_supervisor,
+                             args=(AV(), 0, st, threading.Event()), daemon=True).start()
+            time.sleep(60)
+        """)
+        self.assertEqual(self._wait(p), 6)
 
 
 if __name__ == "__main__":

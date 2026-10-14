@@ -32,6 +32,7 @@ from __future__ import annotations
 import atexit
 import ctypes
 import fcntl
+import io
 import json
 import os
 import queue
@@ -39,7 +40,6 @@ import struct
 import sys
 import threading
 import time
-import traceback
 from ctypes import (
     CDLL,
     POINTER,
@@ -1204,15 +1204,18 @@ def _ensure_log_writer() -> None:
             _LOG_WRITER[0] = t
 
 
-def log(*a):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = " ".join([ts, "[tutk]", *map(str, a)]) + "\n"
+def _enqueue_log(text: str) -> None:
     _ensure_log_writer()
     try:
-        _LOG_Q.put_nowait(line)
+        _LOG_Q.put_nowait(text)
     except queue.Full:
         with _LOG_STATE_LOCK:
             _LOG_DROPPED[0] += 1
+
+
+def log(*a):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    _enqueue_log(" ".join([ts, "[tutk]", *map(str, a)]) + "\n")
 
 
 def _drain(q: queue.Queue, timeout: float) -> bool:
@@ -1233,24 +1236,44 @@ def _log_drain(timeout: float = 2.0) -> bool:
 atexit.register(_log_drain, 2.0)
 
 
-def _excepthook(exc_type, exc, tb) -> None:
-    """Uncaught exceptions go through the queued log too, so printing a traceback
-    cannot block process exit on a stalled log file."""
-    log("uncaught exception:\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
+class _QueuedStderr(io.TextIOBase):
+    """sys.stderr for the stream process: text other modules print (the login
+    guard's and config store's warnings, uncaught-exception tracebacks) goes
+    through the same non-blocking queue as log(). A plain sys.stderr could
+    block its caller on a slow /config, and a writer stuck in it would hold the
+    buffer lock that interpreter shutdown needs for its final flush. Partial
+    writes are joined per thread up to the newline so lines don't interleave."""
+
+    encoding = "utf-8"
+    errors = "backslashreplace"
+
+    def __init__(self):
+        super().__init__()
+        self._local = threading.local()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        buf = getattr(self._local, "buf", "") + text
+        cut = buf.rfind("\n") + 1
+        if cut:
+            _enqueue_log(buf[:cut])
+            buf = buf[cut:]
+        self._local.buf = buf
+        return len(text)
+
+    def flush(self) -> None:
+        buf = getattr(self._local, "buf", "")
+        if buf:
+            self._local.buf = ""
+            _enqueue_log(buf + "\n")
 
 
-def _thread_excepthook(args) -> None:
-    if args.exc_type is SystemExit:
-        return
-    name = args.thread.name if args.thread is not None else "?"
-    log(f"uncaught exception in thread {name!r}:\n"
-        + "".join(traceback.format_exception(args.exc_type, args.exc_value,
-                                             args.exc_traceback)))
-
-
-def _install_excepthooks() -> None:
-    sys.excepthook = _excepthook
-    threading.excepthook = _thread_excepthook
+def _install_queued_stderr() -> None:
+    sys.stderr = _QueuedStderr()
 
 
 def _set_sig(lib, name, restype, argtypes):
@@ -2019,16 +2042,24 @@ _SHUTTING_DOWN = {"flag": False, "logged": False}
 
 def _on_sigterm(*_a) -> None:
     """First SIGTERM: mark shutting down and raise SystemExit so stream_once()'s
-    finally releases the camera session cleanly. Any later SIGTERM is ignored
-    (logged once): raising again would interrupt that very teardown and leave
-    the camera holding a dead session for ~20 s."""
+    finally releases the camera session cleanly. Any later SIGTERM is ignored:
+    raising again would interrupt that very teardown and leave the camera
+    holding a dead session for ~20 s. The repeat is only noted here and logged
+    at exit: a handler that logs could interrupt the main thread inside log()
+    while it holds the queue's lock and deadlock on it."""
     if _SHUTTING_DOWN["flag"]:
-        if not _SHUTTING_DOWN["logged"]:
-            _SHUTTING_DOWN["logged"] = True
-            log("SIGTERM again during shutdown — ignored, session teardown continues")
+        _SHUTTING_DOWN["logged"] = True
         return
     _SHUTTING_DOWN["flag"] = True
     sys.exit(0)
+
+
+def _note_repeated_sigterm() -> None:
+    if _SHUTTING_DOWN["logged"]:
+        log("SIGTERM again during shutdown — ignored, session teardown continued")
+
+
+atexit.register(_note_repeated_sigterm)   # LIFO: runs before the guard and log drains
 
 
 def main() -> None:
@@ -2037,7 +2068,6 @@ def main() -> None:
     # cam holds the single P2P slot and the next connect is refused.
     import signal
     signal.signal(signal.SIGTERM, _on_sigterm)
-    _install_excepthooks()
     # Saved key first; log in at start only if there is no saved UID at all.
     uid = resolve_creds(refresh=not UID)
     last_kms = time.monotonic()
@@ -2106,4 +2136,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    _install_queued_stderr()   # the stream process only (tests call main() directly)
     main()
